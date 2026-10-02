@@ -10,6 +10,8 @@ import msgpack
 from requests.structures import CaseInsensitiveDict
 from urllib3 import HTTPResponse
 
+from cachecontrol.age import AgeInfo
+
 if TYPE_CHECKING:
     from requests import PreparedRequest
 
@@ -45,6 +47,14 @@ class Serializer:
                 "decode_content": response.decode_content,
             }
         }
+
+        # Store the response's age metadata (RFC 9111 section 4.2.3)
+        # alongside it. The controller attaches it when caching; fall
+        # back to capturing it from the headers at dump time.
+        age_info = getattr(response, "cachecontrol_age_info", None)
+        if not isinstance(age_info, AgeInfo):
+            age_info = AgeInfo.from_headers(response_headers)
+        data["age"] = age_info.to_dict()
 
         # Construct our vary headers
         data["vary"] = {}
@@ -143,4 +153,15 @@ class Serializer:
         except ValueError:
             return None
 
-        return self.prepare_response(request, cached, body_file)
+        response = self.prepare_response(request, cached, body_file)
+
+        # Reattach the age metadata. Entries restored by another
+        # process rebase their resident time on the wall clock (see
+        # AgeInfo).
+        age_data = cached.get("age")
+        if response is not None and isinstance(age_data, dict):
+            response.cachecontrol_age_info = AgeInfo.from_dict(  # type: ignore[attr-defined]
+                age_data
+            )
+
+        return response

@@ -26,6 +26,10 @@ class TestVary:
         if "chunked" in resp.raw.headers.get("transfer-encoding", ""):
             resp.raw.headers.pop("transfer-encoding")
 
+        # responses served from the cache carry a computed Age header
+        cached.headers.pop("Age", None)
+        resp.raw.headers.pop("Age", None)
+
         checks = [
             cached._fp.getvalue() == resp.content,
             cached.headers == resp.raw.headers,

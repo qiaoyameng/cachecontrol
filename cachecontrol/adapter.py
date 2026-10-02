@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import time
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
@@ -72,6 +73,11 @@ class CacheControlAdapter(HTTPAdapter):
 
             # check for etags and add headers if appropriate
             request.headers.update(self.controller.conditional_headers(request))
+
+            # Record when the request is sent so the response age can
+            # account for the request/response delay (RFC 9111 section
+            # 4.2.3).
+            request.cachecontrol_request_time = time.time()  # type: ignore[attr-defined]
 
         resp = super().send(request, stream, timeout, verify, cert, proxies)
 

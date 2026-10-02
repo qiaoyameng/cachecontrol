@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
 
+from cachecontrol.age import AgeInfo
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
 from cachecontrol.serialize import Serializer
 
@@ -34,6 +35,14 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+
+
+def _request_sent_time(request: PreparedRequest) -> float | None:
+    """Wall-clock time the request was sent, if the adapter recorded it."""
+    request_time = getattr(request, "cachecontrol_request_time", None)
+    if isinstance(request_time, (int, float)):
+        return float(request_time)
+    return None
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -211,8 +220,19 @@ class CacheController:
             logger.debug("Ignoring cached response: invalid date")
             return False
         date = calendar.timegm(time_tuple[:6])
-        current_age = max(0, now - date)
-        logger.debug("Current age based on date: %i", current_age)
+        date_based_age = max(0.0, now - date)
+        age_info = getattr(resp, "cachecontrol_age_info", None)
+        if isinstance(age_info, AgeInfo):
+            # Full RFC 9111 section 4.2.3 accounting: upstream Age,
+            # request/response delay and local resident time. The
+            # Date-based estimate is kept as a lower bound so a stored
+            # Date can never make the entry look younger than it is.
+            current_age = max(date_based_age, age_info.current_age(now=now))
+            logger.debug("Current age based on age metadata: %i", current_age)
+        else:
+            # Legacy entries without age metadata fall back to Date.
+            current_age = date_based_age
+            logger.debug("Current age based on date: %i", current_age)
 
         # TODO: There is an assumption that the result will be a
         #       urllib3 response object. This may not be best since we
@@ -241,6 +261,7 @@ class CacheController:
         # does not provide an explicit freshness lifetime.
         elif int(resp.status) in PERMANENT_REDIRECT_STATUSES:
             logger.debug("Returning cached permanent redirect response")
+            resp.headers["Age"] = str(int(current_age))
             return resp
 
         # Determine if we are setting freshness limit in the
@@ -252,6 +273,9 @@ class CacheController:
                 "Freshness lifetime from request max-age: %i", freshness_lifetime
             )
 
+        # The Age header we emit reflects the actual age, not the
+        # min-fresh adjusted value used for the freshness comparison.
+        served_age = current_age
         min_fresh = cc.get("min-fresh")
         if min_fresh is not None:
             # adjust our current age by our min fresh
@@ -262,6 +286,7 @@ class CacheController:
         if freshness_lifetime > current_age:
             logger.debug('The response is "fresh", returning cached response')
             logger.debug("%i > %i", freshness_lifetime, current_age)
+            resp.headers["Age"] = str(int(served_age))
             return resp
 
         # we're not fresh. If we don't have an Etag, clear it out
@@ -405,6 +430,15 @@ class CacheController:
             logger.debug('Response header has "Vary: *"')
             return
 
+        # Record the response's age metadata (RFC 9111 section 4.2.3):
+        # the upstream Age, the request/response delay and the local
+        # receipt time, so freshness later accounts for more than the
+        # Date header. The serializer stores this alongside the response.
+        response.cachecontrol_age_info = AgeInfo.from_headers(  # type: ignore[attr-defined]
+            response_headers,
+            request_time=_request_sent_time(request),
+        )
+
         # If we've been given an etag, then keep the response
         if self.cache_etags and "etag" in response_headers:
             expires_time = 0
@@ -510,7 +544,20 @@ class CacheController:
         # we want a 200 b/c we have content via the cache
         cached_response.status = 200
 
+        # Revalidation resets the age basis: recompute the age metadata
+        # from the validated headers and this exchange's timing. This
+        # also ensures an Age header we previously emitted on a cache
+        # hit is not accumulated a second time.
+        age_info = AgeInfo.from_headers(
+            cached_response.headers,
+            request_time=_request_sent_time(request),
+        )
+        cached_response.cachecontrol_age_info = age_info  # type: ignore[attr-defined]
+
         # update our cache
         self._cache_set(cache_url, request, cached_response)
+
+        # Serve the revalidated response with its current age.
+        cached_response.headers["Age"] = str(int(age_info.current_age()))
 
         return cached_response
