@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import functools
+import logging
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
 
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from cachecontrol.cache import DictCache
 from cachecontrol.controller import PERMANENT_REDIRECT_STATUSES, CacheController
@@ -23,6 +25,9 @@ if TYPE_CHECKING:
     from cachecontrol.serialize import Serializer
 
 
+logger = logging.getLogger(__name__)
+
+
 class CacheControlAdapter(HTTPAdapter):
     invalidating_methods = {"PUT", "PATCH", "DELETE"}
 
@@ -34,6 +39,8 @@ class CacheControlAdapter(HTTPAdapter):
         serializer: Serializer | None = None,
         heuristic: BaseHeuristic | None = None,
         cacheable_methods: Collection[str] | None = None,
+        stale_if_error: bool | int = False,
+        stale_if_error_status_codes: Collection[int] | None = None,
         *args: Any,
         **kw: Any,
     ) -> None:
@@ -44,7 +51,11 @@ class CacheControlAdapter(HTTPAdapter):
 
         controller_factory = controller_class or CacheController
         self.controller = controller_factory(
-            self.cache, cache_etags=cache_etags, serializer=serializer
+            self.cache,
+            cache_etags=cache_etags,
+            serializer=serializer,
+            stale_if_error=stale_if_error,
+            stale_if_error_status_codes=stale_if_error_status_codes,
         )
 
     def send(
@@ -62,18 +73,54 @@ class CacheControlAdapter(HTTPAdapter):
         exists in the cache and cache the response if we need to and can.
         """
         cacheable = cacheable_methods or self.cacheable_methods
+        cached_response = False
         if request.method in cacheable:
             try:
                 cached_response = self.controller.cached_request(request)
             except zlib.error:
                 cached_response = None
             if cached_response:
-                return self.build_response(request, cached_response, from_cache=True)
+                return self.build_response(
+                    request,
+                    cached_response,
+                    from_cache=True,
+                    from_cache_reason="fresh",
+                )
 
             # check for etags and add headers if appropriate
             request.headers.update(self.controller.conditional_headers(request))
 
-        resp = super().send(request, stream, timeout, verify, cert, proxies)
+        try:
+            resp = super().send(request, stream, timeout, verify, cert, proxies)
+        except RequestsConnectionError:
+            if request.method in cacheable:
+                cached_response = self.controller.stale_if_error_response(request)
+                if cached_response:
+                    logger.info("Serving stale response due to connection error")
+                    return self.build_response(
+                        request,
+                        cached_response,
+                        from_cache=True,
+                        from_cache_reason="stale-if-error",
+                    )
+            raise
+
+        if (
+            request.method in cacheable
+            and 500 <= int(resp.status_code) < 600
+            and int(resp.status_code)
+            in self.controller.stale_if_error_status_codes
+        ):
+            cached_response = self.controller.stale_if_error_response(request)
+            if cached_response:
+                resp.close()
+                logger.info("Serving stale response due to HTTP %s", resp.status_code)
+                return self.build_response(
+                    request,
+                    cached_response,
+                    from_cache=True,
+                    from_cache_reason="stale-if-error",
+                )
 
         return resp
 
@@ -83,6 +130,7 @@ class CacheControlAdapter(HTTPAdapter):
         response: HTTPResponse,
         from_cache: bool = False,
         cacheable_methods: Collection[str] | None = None,
+        from_cache_reason: str | None = None,
     ) -> Response:
         """
         Build a response by making a request or using the cache.
@@ -109,6 +157,7 @@ class CacheControlAdapter(HTTPAdapter):
 
                 if cached_response is not response:
                     from_cache = True
+                    from_cache_reason = "revalidated"
 
                 # We are done with the server response, read a
                 # possible response body (compliant servers will
@@ -163,6 +212,7 @@ class CacheControlAdapter(HTTPAdapter):
 
         # Give the request a from_cache attr to let people use it
         resp.from_cache = from_cache  # type: ignore[attr-defined]
+        resp.from_cache_reason = from_cache_reason  # type: ignore[attr-defined]
 
         return resp
 

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+STALE_IF_ERROR_STATUSES = (500, 502, 503, 504)
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -56,11 +57,23 @@ class CacheController:
         cache_etags: bool = True,
         serializer: Serializer | None = None,
         status_codes: Collection[int] | None = None,
+        stale_if_error: bool | int = False,
+        stale_if_error_status_codes: Collection[int] | None = None,
     ):
         self.cache = DictCache() if cache is None else cache
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
         self.cacheable_status_codes = status_codes or (200, 203, 300, 301, 308)
+        self.stale_if_error = stale_if_error
+        self.stale_if_error_status_codes = (
+            stale_if_error_status_codes or STALE_IF_ERROR_STATUSES
+        )
+
+    @property
+    def stale_if_error_enabled(self) -> bool:
+        if isinstance(self.stale_if_error, bool):
+            return self.stale_if_error
+        return self.stale_if_error > 0
 
     @classmethod
     def _urlnorm(cls, uri: str) -> str:
@@ -92,6 +105,7 @@ class CacheController:
             "max-age": (int, True),
             "max-stale": (int, False),
             "min-fresh": (int, True),
+            "stale-if-error": (int, True),
             "no-cache": (None, False),
             "no-store": (None, False),
             "no-transform": (None, False),
@@ -185,6 +199,10 @@ class CacheController:
             logger.debug('Request header has "max_age" as 0, cache bypassed')
             return False
 
+        if "no-store" in cc:
+            logger.debug('Request header has "no-store", cache bypassed')
+            return False
+
         # Check whether we can load the response from the cache:
         resp = self._load_from_cache(request)
         if not resp:
@@ -264,13 +282,107 @@ class CacheController:
             logger.debug("%i > %i", freshness_lifetime, current_age)
             return resp
 
-        # we're not fresh. If we don't have an Etag, clear it out
+        # We're not fresh. Keep stale entries available for explicit
+        # stale-if-error handling, but otherwise clear stale entries without
+        # an ETag.
         if "etag" not in headers:
-            logger.debug('The cached response is "stale" with no etag, purging')
-            self.cache.delete(cache_url)
+            if not self.stale_if_error_enabled:
+                logger.debug('The cached response is "stale" with no etag, purging')
+                self.cache.delete(cache_url)
+            else:
+                logger.debug(
+                    'The cached response is "stale", retaining for error fallback'
+                )
 
         # return the original handler
         return False
+
+    def stale_if_error_response(
+        self, request: PreparedRequest
+    ) -> HTTPResponse | Literal[False]:
+        """Return a stale response when stale-if-error permits it."""
+        if not self.stale_if_error_enabled:
+            return False
+
+        request_cc = self.parse_cache_control(request.headers)
+        if "no-cache" in request_cc or "no-store" in request_cc:
+            return False
+        if request_cc.get("max-age") == 0:
+            return False
+        min_fresh = request_cc.get("min-fresh")
+        if min_fresh is not None and min_fresh > 0:
+            return False
+
+        resp = self._load_from_cache(request)
+        if not resp:
+            return False
+
+        headers = CaseInsensitiveDict(resp.headers)
+        response_cc = self.parse_cache_control(headers)
+        if (
+            not headers
+            or "date" not in headers
+            or "no-store" in response_cc
+            or "no-cache" in response_cc
+            or "must-revalidate" in response_cc
+            or "proxy-revalidate" in response_cc
+        ):
+            return False
+
+        time_tuple = parsedate_tz(headers["date"])
+        if time_tuple is None:
+            return False
+
+        response_stale_if_error = response_cc.get("stale-if-error")
+        request_stale_if_error = request_cc.get("stale-if-error")
+        allowed_stale: int | None = None
+
+        if response_stale_if_error is not None and response_stale_if_error >= 0:
+            allowed_stale = response_stale_if_error
+        if request_stale_if_error is not None and request_stale_if_error >= 0:
+            allowed_stale = (
+                request_stale_if_error
+                if allowed_stale is None
+                else min(allowed_stale, request_stale_if_error)
+            )
+        if isinstance(self.stale_if_error, int) and not isinstance(
+            self.stale_if_error, bool
+        ):
+            client_stale_if_error = self.stale_if_error
+            allowed_stale = (
+                client_stale_if_error
+                if allowed_stale is None
+                else min(allowed_stale, client_stale_if_error)
+            )
+        if allowed_stale is None:
+            return False
+
+        request_max_stale = request_cc.get("max-stale")
+        if request_max_stale is not None:
+            if request_max_stale < 0:
+                return False
+            allowed_stale = min(allowed_stale, request_max_stale)
+
+        date = calendar.timegm(time_tuple[:6])
+        current_age = max(0, time.time() - date)
+
+        freshness_lifetime = 0
+        max_age = response_cc.get("max-age")
+        if max_age is not None:
+            freshness_lifetime = max_age
+        elif "expires" in headers:
+            expires = parsedate_tz(headers["expires"])
+            if expires is not None:
+                freshness_lifetime = max(
+                    0, calendar.timegm(expires[:6]) - date
+                )
+
+        staleness = max(0, current_age - freshness_lifetime)
+        if staleness > allowed_stale:
+            return False
+
+        resp.from_cache_reason = "stale-if-error"
+        return resp
 
     def conditional_headers(self, request: PreparedRequest) -> dict[str, str]:
         resp = self._load_from_cache(request)
