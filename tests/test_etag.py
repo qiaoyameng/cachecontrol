@@ -94,15 +94,17 @@ class TestETag:
         # the server told us that was fine.
         assert r.from_cache
 
-    def test_etags_get_with_range(self, sess, server):
-        """A 'Range' header stops us from using the cache altogether."""
+    def test_etags_get_with_stale_range_revalidates_normally(self, sess, server):
+        """A stale range request revalidates the complete cached response."""
         # get our response
         r = sess.get(self.etag_url)
+        r.raw.headers["Date"] = "Tue, 26 Nov 2012 00:50:49 GMT"
+        self.cache.set(self.etag_url, r.raw)
 
         r = sess.get(self.etag_url, headers={"Range": "0-10"})
-        assert "if-none-match" not in r.request.headers
+        assert r.request.headers["if-none-match"] == self.etag_string
         assert r.status_code == 200
-        assert not r.from_cache
+        assert r.from_cache
 
 
 class TestDisabledETags:

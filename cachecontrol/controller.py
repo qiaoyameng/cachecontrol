@@ -9,14 +9,16 @@ The httplib2 algorithms ported for use with requests.
 from __future__ import annotations
 
 import calendar
+import io
 import logging
 import re
 import time
 import weakref
 from email.utils import parsedate_tz
-from typing import TYPE_CHECKING, Collection, Mapping
+from typing import TYPE_CHECKING, Any, Collection, IO, Mapping
 
 from requests.structures import CaseInsensitiveDict
+from urllib3 import HTTPResponse
 
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
 from cachecontrol.serialize import Serializer
@@ -25,8 +27,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from requests import PreparedRequest
-    from urllib3 import HTTPResponse
-
     from cachecontrol.cache import BaseCache
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,83 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+
+
+class _PartialBody(io.RawIOBase):
+    def __init__(
+        self,
+        body: IO[bytes],
+        start: int,
+        length: int,
+        owner: HTTPResponse,
+    ) -> None:
+        super().__init__()
+        self._body = body
+        self._owner = owner
+        self._start = start
+        self._remaining = length
+
+    def _seek_to_start(self) -> None:
+        self._body.seek(self._start)
+        self._start = -1
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if self._start >= 0:
+            self._seek_to_start()
+        size = min(len(buffer), self._remaining)
+        if size == 0:
+            return 0
+        data = self._body.read(size)
+        buffer[: len(data)] = data
+        self._remaining -= len(data)
+        return len(data)
+
+
+def _parse_byte_range(value: str) -> tuple[int | None, int | None] | None:
+    value = value.strip()
+    if not value.startswith("bytes="):
+        return None
+
+    ranges = value[len("bytes=") :].split(",")
+    if len(ranges) != 1:
+        return None
+
+    range_spec = ranges[0].strip()
+    parts = range_spec.split("-", 1)
+    if len(parts) != 2:
+        return None
+
+    start_value, end_value = (part.strip() for part in parts)
+    if start_value:
+        if not start_value.isdigit():
+            return None
+        start = int(start_value)
+        end = int(end_value) if end_value else None
+        if end is not None and end < start:
+            return None
+        return start, end
+
+    if not end_value or not end_value.isdigit():
+        return None
+    return None, int(end_value)
+
+
+def _etag_is_strong(value: str) -> bool:
+    value = value.strip()
+    return bool(value) and not value.startswith(("W/", "w/"))
+
+
+def _http_dates_match(first: str, second: str) -> bool:
+    first_time = parsedate_tz(first.strip())
+    second_time = parsedate_tz(second.strip())
+    if first_time is None or second_time is None:
+        return False
+    first_epoch = calendar.timegm(first_time[:6]) - (first_time[9] or 0)
+    second_epoch = calendar.timegm(second_time[:6]) - (second_time[9] or 0)
+    return first_epoch == second_epoch
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -144,11 +221,6 @@ class CacheController:
         """
         Load a cached response, or return None if it's not available.
         """
-        # We do not support caching of partial content: so if the request contains a
-        # Range header then we don't want to load anything from the cache.
-        if "Range" in request.headers:
-            return None
-
         cache_url = request.url
         assert cache_url is not None
         cache_data = self.cache.get(cache_url)
@@ -262,7 +334,7 @@ class CacheController:
         if freshness_lifetime > current_age:
             logger.debug('The response is "fresh", returning cached response')
             logger.debug("%i > %i", freshness_lifetime, current_age)
-            return resp
+            return self._maybe_cached_range(request, resp)
 
         # we're not fresh. If we don't have an Etag, clear it out
         if "etag" not in headers:
@@ -273,6 +345,13 @@ class CacheController:
         return False
 
     def conditional_headers(self, request: PreparedRequest) -> dict[str, str]:
+        if "Range" in request.headers:
+            range_spec = _parse_byte_range(request.headers["Range"])
+            if range_spec is None:
+                # Multipart and syntactically unsupported ranges are passed
+                # through to the network unchanged.
+                return {}
+
         resp = self._load_from_cache(request)
         new_headers = {}
 
@@ -286,6 +365,140 @@ class CacheController:
                 new_headers["If-Modified-Since"] = headers["Last-Modified"]
 
         return new_headers
+
+    def _range_if_range_matches(
+        self, headers: CaseInsensitiveDict[str], if_range: str
+    ) -> bool:
+        if_range = if_range.strip()
+        if if_range.startswith(('"', "W/", "w/")):
+            etag = headers.get("etag", "").strip()
+            return (
+                _etag_is_strong(if_range)
+                and _etag_is_strong(etag)
+                and if_range == etag
+            )
+
+        last_modified = headers.get("last-modified")
+        if last_modified is None:
+            return False
+        return _http_dates_match(if_range, last_modified)
+
+    def _build_cached_range_response(
+        self,
+        cached_response: HTTPResponse,
+        body: IO[bytes],
+        start: int,
+        end: int,
+        total_length: int,
+        status: int,
+    ) -> HTTPResponse:
+        headers = CaseInsensitiveDict(cached_response.headers)
+        headers["Content-Length"] = str(max(0, end - start + 1))
+        headers["Content-Range"] = f"bytes {start}-{end}/{total_length}"
+        headers.pop("Content-MD5", None)
+        headers.pop("Transfer-Encoding", None)
+        if status == 416:
+            headers["Content-Length"] = "0"
+            headers["Content-Range"] = f"bytes */{total_length}"
+
+        return HTTPResponse(
+            body=body,
+            headers=headers,
+            status=status,
+            version=cached_response.version,
+            reason="Partial Content" if status == 206 else "Range Not Satisfiable",
+            preload_content=False,
+            decode_content=cached_response.decode_content,
+        )
+
+    def _representation_length(
+        self, headers: CaseInsensitiveDict[str], body: IO[bytes]
+    ) -> int | None:
+        content_length = headers.get("content-length", "")
+        if content_length.isdigit():
+            return int(content_length)
+
+        if not body.seekable():
+            return None
+
+        position = body.tell()
+        body.seek(0, io.SEEK_END)
+        length = body.tell()
+        body.seek(position)
+        return length
+
+    def _maybe_cached_range(
+        self, request: PreparedRequest, cached_response: HTTPResponse
+    ) -> HTTPResponse | Literal[False]:
+        range_header = request.headers.get("Range")
+        if range_header is None or request.method != "GET":
+            return cached_response
+
+        parsed_range = _parse_byte_range(range_header)
+        if parsed_range is None:
+            return False
+
+        if int(cached_response.status) != 200:
+            return cached_response
+
+        headers = CaseInsensitiveDict(cached_response.headers)
+        if_range = request.headers.get("If-Range")
+        if if_range is not None and not self._range_if_range_matches(
+            headers, if_range
+        ):
+            return cached_response
+
+        body: IO[bytes] | None = getattr(cached_response, "_fp", None)
+        if body is None:
+            return False
+        total_length = self._representation_length(headers, body)
+        if total_length is None:
+            return False
+        if not body.seekable():
+            return False
+
+        requested_start, requested_end = parsed_range
+        if requested_start is None:
+            suffix_length = requested_end
+            assert suffix_length is not None
+            if total_length == 0 or suffix_length == 0:
+                return self._build_cached_range_response(
+                    cached_response,
+                    io.BytesIO(b""),
+                    0,
+                    -1,
+                    total_length,
+                    416,
+                )
+            start = max(0, total_length - suffix_length)
+            end = total_length - 1
+        else:
+            start = requested_start
+            if start >= total_length:
+                return self._build_cached_range_response(
+                    cached_response,
+                    io.BytesIO(b""),
+                    0,
+                    -1,
+                    total_length,
+                    416,
+                )
+            end = (
+                total_length - 1
+                if requested_end is None or requested_end >= total_length
+                else requested_end
+            )
+
+        length = end - start + 1
+        response_body = _PartialBody(body, start, length, cached_response)
+        return self._build_cached_range_response(
+            cached_response,
+            response_body,
+            start,
+            end,
+            total_length,
+            206,
+        )
 
     def _cache_set(
         self,
@@ -344,8 +557,12 @@ class CacheController:
         else:
             response = response_or_ref
 
-        # From httplib2: Don't cache 206's since we aren't going to
-        #                handle byte range requests
+        # A 206 is only a partial representation and must never overwrite a
+        # cached complete response. Multipart range handling stays on network.
+        if response.status == 206:
+            logger.debug("Partial response not cached")
+            return
+
         cacheable_status_codes = status_codes or self.cacheable_status_codes
         if response.status not in cacheable_status_codes:
             logger.debug(
@@ -510,7 +727,9 @@ class CacheController:
         # we want a 200 b/c we have content via the cache
         cached_response.status = 200
 
-        # update our cache
+        # Update the cache while the response is still the complete
+        # representation. A locally generated 206 must never replace it.
         self._cache_set(cache_url, request, cached_response)
 
-        return cached_response
+        range_response = self._maybe_cached_range(request, cached_response)
+        return range_response if range_response else cached_response
