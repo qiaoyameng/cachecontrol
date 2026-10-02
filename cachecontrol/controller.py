@@ -10,14 +10,25 @@ from __future__ import annotations
 
 import calendar
 import logging
+import math
 import re
 import time
+import uuid
 import weakref
 from email.utils import parsedate_tz
 from typing import TYPE_CHECKING, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
 
+from cachecontrol._age import (
+    AGE_CORRECTED_INITIAL_AGE,
+    AGE_RECORD_ID,
+    AGE_REQUEST_MONOTONIC_TIME,
+    AGE_REQUEST_WALL_TIME,
+    AGE_RESPONSE_MONOTONIC_TIME,
+    AGE_RESPONSE_WALL_TIME,
+    is_real_number,
+)
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
 from cachecontrol.serialize import Serializer
 
@@ -47,6 +58,32 @@ def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
     return (groups[1], groups[3], groups[4], groups[6], groups[8])
 
 
+def parse_http_date(value: str | None) -> int | None:
+    if not isinstance(value, str):
+        return None
+
+    parsed = parsedate_tz(value)
+    if parsed is None:
+        return None
+
+    try:
+        return calendar.timegm(parsed[:6]) - (parsed[9] or 0)
+    except (OverflowError, ValueError):
+        return None
+
+
+def parse_age(headers: Mapping[str, str]) -> int | None:
+    value = headers.get("age")
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    if not value.isdigit():
+        return None
+
+    return int(value)
+
+
 class CacheController:
     """An interface to see if request should cached or not."""
 
@@ -61,6 +98,107 @@ class CacheController:
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
         self.cacheable_status_codes = status_codes or (200, 203, 300, 301, 308)
+        self._age_records: dict[str, float] = {}
+
+    def _response_time(
+        self,
+        response: HTTPResponse,
+        wall_attr: str,
+        monotonic_attr: str,
+        request: PreparedRequest | None = None,
+    ) -> tuple[float, float, float]:
+        response_wall_time = getattr(response, wall_attr, None)
+        response_monotonic_time = getattr(response, monotonic_attr, None)
+        if not is_real_number(response_wall_time) or not is_real_number(
+            response_monotonic_time
+        ):
+            return time.time(), time.monotonic(), 0.0
+
+        request_wall_time = getattr(request, AGE_REQUEST_WALL_TIME, None)
+        if request_wall_time is None:
+            request_wall_time = getattr(response, AGE_REQUEST_WALL_TIME, None)
+        request_monotonic_time = getattr(
+            request, AGE_REQUEST_MONOTONIC_TIME, None
+        )
+        if request_monotonic_time is None:
+            request_monotonic_time = getattr(
+                response, AGE_REQUEST_MONOTONIC_TIME, None
+            )
+        if not is_real_number(request_wall_time) or not is_real_number(
+            request_monotonic_time
+        ):
+            request_delay = 0.0
+        else:
+            request_delay = max(
+                0.0, response_monotonic_time - request_monotonic_time
+            )
+
+        return (
+            float(response_wall_time),
+            float(response_monotonic_time),
+            request_delay,
+        )
+
+    def _record_response_age(
+        self,
+        response: HTTPResponse,
+        headers: Mapping[str, str],
+        date: int,
+        request: PreparedRequest | None = None,
+    ) -> None:
+        response_wall_time, response_monotonic_time, request_delay = (
+            self._response_time(
+                response,
+                AGE_RESPONSE_WALL_TIME,
+                AGE_RESPONSE_MONOTONIC_TIME,
+                request,
+            )
+        )
+        upstream_age = parse_age(headers) or 0
+        apparent_age = max(0, response_wall_time - date)
+        corrected_initial_age = max(
+            math.ceil(apparent_age), math.ceil(upstream_age + request_delay)
+        )
+        record_id = uuid.uuid4().hex
+        self._age_records[record_id] = response_monotonic_time
+
+        setattr(response, AGE_CORRECTED_INITIAL_AGE, corrected_initial_age)
+        setattr(response, AGE_RESPONSE_MONOTONIC_TIME, response_monotonic_time)
+        setattr(response, AGE_RESPONSE_WALL_TIME, response_wall_time)
+        setattr(response, AGE_RECORD_ID, record_id)
+
+    def _current_age(
+        self, response: HTTPResponse, headers: Mapping[str, str], date: int
+    ) -> int:
+        corrected_initial_age = getattr(
+            response, AGE_CORRECTED_INITIAL_AGE, None
+        )
+        response_wall_time = getattr(response, AGE_RESPONSE_WALL_TIME, None)
+        record_id = getattr(response, AGE_RECORD_ID, None)
+
+        if (
+            not isinstance(corrected_initial_age, bool)
+            and isinstance(corrected_initial_age, int)
+            and corrected_initial_age >= 0
+            and is_real_number(response_wall_time)
+        ):
+            monotonic_anchor = self._age_records.get(record_id)
+            if is_real_number(monotonic_anchor):
+                residence_time = max(0.0, time.monotonic() - monotonic_anchor)
+            else:
+                residence_time = max(0.0, time.time() - response_wall_time)
+            return corrected_initial_age + math.ceil(residence_time)
+
+        upstream_age = parse_age(headers) or 0
+        now = time.time()
+        apparent_age = max(0, now - date)
+        current_age = max(upstream_age, math.ceil(apparent_age))
+        record_id = uuid.uuid4().hex
+        self._age_records[record_id] = time.monotonic()
+        setattr(response, AGE_CORRECTED_INITIAL_AGE, current_age)
+        setattr(response, AGE_RESPONSE_WALL_TIME, now)
+        setattr(response, AGE_RECORD_ID, record_id)
+        return current_age
 
     @classmethod
     def _urlnorm(cls, uri: str) -> str:
@@ -205,13 +343,11 @@ class CacheController:
             logger.debug("Ignoring cached response: no date")
             return False
 
-        now = time.time()
-        time_tuple = parsedate_tz(headers["date"])
-        if time_tuple is None:
+        date = parse_http_date(headers.get("date"))
+        if date is None:
             logger.debug("Ignoring cached response: invalid date")
             return False
-        date = calendar.timegm(time_tuple[:6])
-        current_age = max(0, now - date)
+        current_age = self._current_age(resp, headers, date)
         logger.debug("Current age based on date: %i", current_age)
 
         # TODO: There is an assumption that the result will be a
@@ -231,9 +367,9 @@ class CacheController:
 
         # If there isn't a max-age, check for an expires header
         elif "expires" in headers:
-            expires = parsedate_tz(headers["expires"])
+            expires = parse_http_date(headers["expires"])
             if expires is not None:
-                expire_time = calendar.timegm(expires[:6]) - date
+                expire_time = expires - date
                 freshness_lifetime = max(0, expire_time)
                 logger.debug("Freshness lifetime from expires: %i", freshness_lifetime)
 
@@ -241,6 +377,8 @@ class CacheController:
         # does not provide an explicit freshness lifetime.
         elif int(resp.status) in PERMANENT_REDIRECT_STATUSES:
             logger.debug("Returning cached permanent redirect response")
+            if "cache-control" in headers or "expires" in headers:
+                resp.headers["Age"] = str(current_age)
             return resp
 
         # Determine if we are setting freshness limit in the
@@ -262,6 +400,7 @@ class CacheController:
         if freshness_lifetime > current_age:
             logger.debug('The response is "fresh", returning cached response')
             logger.debug("%i > %i", freshness_lifetime, current_age)
+            resp.headers["Age"] = str(current_age)
             return resp
 
         # we're not fresh. If we don't have an Etag, clear it out
@@ -357,11 +496,7 @@ class CacheController:
             response.headers
         )
 
-        if "date" in response_headers:
-            time_tuple = parsedate_tz(response_headers["date"])
-            date = calendar.timegm(time_tuple[:6]) if time_tuple is not None else 0
-        else:
-            date = 0
+        date = parse_http_date(response_headers.get("date")) or 0
 
         # If we've been given a body, our response has a Content-Length, that
         # Content-Length is valid then we can check to see if the body we've
@@ -405,13 +540,22 @@ class CacheController:
             logger.debug('Response header has "Vary: *"')
             return
 
+        response_date: int | None = None
+        if "date" in response_headers:
+            response_date = parse_http_date(response_headers["date"])
+            if response_date is None:
+                return
+            self._record_response_age(
+                response, response_headers, response_date, request
+            )
+
         # If we've been given an etag, then keep the response
         if self.cache_etags and "etag" in response_headers:
             expires_time = 0
             if response_headers.get("expires"):
-                expires = parsedate_tz(response_headers["expires"])
+                expires = parse_http_date(response_headers["expires"])
                 if expires is not None:
-                    expires_time = calendar.timegm(expires[:6]) - date
+                    expires_time = expires - date
 
             expires_time = max(expires_time, 14 * 86400)
 
@@ -429,10 +573,7 @@ class CacheController:
         # is no date header then we can't do anything about expiring
         # the cache.
         elif "date" in response_headers:
-            time_tuple = parsedate_tz(response_headers["date"])
-            if time_tuple is None:
-                return
-            date = calendar.timegm(time_tuple[:6])
+            date = response_date
             # cache when there is a max-age > 0
             max_age = cc.get("max-age")
             if max_age is not None and max_age > 0:
@@ -450,13 +591,13 @@ class CacheController:
             # in the meantime.
             elif "expires" in response_headers:
                 if response_headers["expires"]:
-                    expires = parsedate_tz(response_headers["expires"])
+                    expires = parse_http_date(response_headers["expires"])
                     if expires is None:
                         # https://tools.ietf.org/html/rfc9111#section-5.3: an
                         # invalid Expires must be read as a time in the past.
                         expires_time = 0
                     else:
-                        expires_time = calendar.timegm(expires[:6]) - date
+                        expires_time = expires - date
 
                     # A non-positive lifetime here means the response arrived
                     # stale
@@ -490,6 +631,12 @@ class CacheController:
             # we didn't have a cached response
             return response
 
+        validated_date = parse_http_date(response.headers.get("date"))
+        if validated_date is not None:
+            self._record_response_age(
+                response, response.headers, validated_date, request
+            )
+
         # Lets update our headers with the headers from the new request:
         # http://tools.ietf.org/html/draft-ietf-httpbis-p4-conditional-26#section-4.1
         #
@@ -509,6 +656,21 @@ class CacheController:
 
         # we want a 200 b/c we have content via the cache
         cached_response.status = 200
+
+        validated_corrected_initial_age = getattr(
+            response, AGE_CORRECTED_INITIAL_AGE, None
+        )
+        if validated_corrected_initial_age is not None:
+            for attr in (
+                AGE_CORRECTED_INITIAL_AGE,
+                AGE_RECORD_ID,
+                AGE_RESPONSE_MONOTONIC_TIME,
+                AGE_RESPONSE_WALL_TIME,
+            ):
+                setattr(cached_response, attr, getattr(response, attr))
+            cached_response.headers["Age"] = str(
+                validated_corrected_initial_age
+            )
 
         # update our cache
         self._cache_set(cache_url, request, cached_response)

@@ -13,6 +13,13 @@ from urllib3 import HTTPResponse
 if TYPE_CHECKING:
     from requests import PreparedRequest
 
+from cachecontrol._age import (
+    AGE_CORRECTED_INITIAL_AGE,
+    AGE_RECORD_ID,
+    AGE_RESPONSE_WALL_TIME,
+    is_real_number,
+)
+
 
 class Serializer:
     serde_version = "4"
@@ -26,6 +33,12 @@ class Serializer:
         response_headers: CaseInsensitiveDict[str] = CaseInsensitiveDict(
             response.headers
         )
+        serialized_headers = {
+            key: value
+            for key, value in response_headers.items()
+            if key.lower() != "age"
+            or not hasattr(response, AGE_CORRECTED_INITIAL_AGE)
+        }
 
         if body is None:
             # When a body isn't passed in, we'll read the response. We
@@ -38,12 +51,23 @@ class Serializer:
         data = {
             "response": {
                 "body": body,  # Empty bytestring if body is stored separately
-                "headers": {str(k): str(v) for k, v in response.headers.items()},
+                "headers": {str(k): str(v) for k, v in serialized_headers.items()},
                 "status": response.status,
                 "version": response.version,
                 "reason": str(response.reason),
                 "decode_content": response.decode_content,
+            },
+            "age": {
+                "corrected_initial_age": getattr(
+                    response, AGE_CORRECTED_INITIAL_AGE
+                ),
+                "response_monotonic_time": None,
+                "response_wall_time": getattr(response, AGE_RESPONSE_WALL_TIME),
+                "record_id": getattr(response, AGE_RECORD_ID),
+                "time_base": "wall-clock",
             }
+            if hasattr(response, AGE_CORRECTED_INITIAL_AGE)
+            else None,
         }
 
         # Construct our vary headers
@@ -130,7 +154,36 @@ class Serializer:
         # Discard any `strict` parameter serialized by older version of cachecontrol.
         cached["response"].pop("strict", None)
 
-        return HTTPResponse(body=body, preload_content=False, **cached["response"])
+        response = HTTPResponse(
+            body=body, preload_content=False, **cached["response"]
+        )
+        age_metadata = cached.get("age")
+        if isinstance(age_metadata, Mapping):
+            corrected_initial_age = age_metadata.get("corrected_initial_age")
+            response_wall_time = age_metadata.get("response_wall_time")
+            if (
+                not isinstance(corrected_initial_age, bool)
+                and isinstance(corrected_initial_age, int)
+                and corrected_initial_age >= 0
+                and is_real_number(response_wall_time)
+            ):
+                setattr(
+                    response,
+                    AGE_CORRECTED_INITIAL_AGE,
+                    corrected_initial_age,
+                )
+                setattr(
+                    response,
+                    AGE_RESPONSE_WALL_TIME,
+                    float(response_wall_time),
+                )
+                setattr(
+                    response,
+                    AGE_RECORD_ID,
+                    age_metadata.get("record_id"),
+                )
+
+        return response
 
     def _loads_v4(
         self,

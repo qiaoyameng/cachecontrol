@@ -7,6 +7,11 @@ from unittest.mock import Mock
 import msgpack
 import requests
 
+from cachecontrol._age import (
+    AGE_CORRECTED_INITIAL_AGE,
+    AGE_RECORD_ID,
+    AGE_RESPONSE_WALL_TIME,
+)
 from cachecontrol.serialize import Serializer
 
 
@@ -114,3 +119,36 @@ class TestSerializer:
         self.serializer.dumps(resp.request, resp.raw)
 
         assert resp.content == b"0123456789"
+
+    def test_age_metadata_restored_with_wall_clock_anchor(self):
+        req = Mock()
+        response = HTTPResponseMock(
+            b"Hello World",
+            headers={
+                "Content-Type": "text/plain",
+                "Age": "19",
+            },
+        )
+        setattr(response, AGE_CORRECTED_INITIAL_AGE, 14)
+        setattr(response, AGE_RESPONSE_WALL_TIME, 1004.0)
+        setattr(response, AGE_RECORD_ID, "in-process-id")
+
+        serialized = self.serializer.dumps(req, response, b"Hello World")
+        restored = self.serializer.loads(req, serialized)
+
+        assert restored is not None
+        assert getattr(restored, AGE_CORRECTED_INITIAL_AGE) == 14
+        assert getattr(restored, AGE_RESPONSE_WALL_TIME) == 1004.0
+        assert getattr(restored, AGE_RECORD_ID) == "in-process-id"
+        assert "Age" not in restored.headers
+
+
+class HTTPResponseMock:
+    status = 200
+    version = 11
+    reason = ""
+    decode_content = True
+
+    def __init__(self, body, headers):
+        self.body = body
+        self.headers = headers

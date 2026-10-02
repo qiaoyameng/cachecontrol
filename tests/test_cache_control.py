@@ -10,9 +10,16 @@ import os
 import time
 from unittest.mock import ANY, Mock
 
+import msgpack
 import pytest
 
 from cachecontrol import CacheController
+from cachecontrol._age import (
+    AGE_REQUEST_MONOTONIC_TIME,
+    AGE_REQUEST_WALL_TIME,
+    AGE_RESPONSE_MONOTONIC_TIME,
+    AGE_RESPONSE_WALL_TIME,
+)
 from cachecontrol.cache import DictCache
 from cachecontrol.caches import SeparateBodyFileCache
 
@@ -399,3 +406,129 @@ class TestCacheControlRequest:
         self.c.cache = DictCache({self.url: resp})
 
         assert not self.req({})
+
+    def test_response_age_accounting_recovery_and_304(self, monkeypatch):
+        url = "http://age.example/resource"
+        cache = DictCache()
+        controller = CacheController(cache)
+        request = DummyRequest(url=url, headers={})
+        clock = {"wall": 1004.0, "monotonic": 4.7}
+        monkeypatch.setattr(time, "time", lambda: clock["wall"])
+        monkeypatch.setattr(time, "monotonic", lambda: clock["monotonic"])
+
+        def remaining_freshness(cached_response):
+            max_age = int(cached_response.headers["Cache-Control"].split("=", 1)[1])
+            return max_age - int(cached_response.headers["Age"])
+
+        response = DummyResponse(
+            200,
+            {
+                "Date": time.strftime(TIME_FMT, time.gmtime(1000)),
+                "Age": "10",
+                "Cache-Control": "max-age=100",
+                "ETag": '"v1"',
+            },
+        )
+        setattr(request, AGE_REQUEST_WALL_TIME, 1000.0)
+        setattr(request, AGE_REQUEST_MONOTONIC_TIME, 0.0)
+        setattr(response, AGE_RESPONSE_WALL_TIME, 1004.0)
+        setattr(response, AGE_RESPONSE_MONOTONIC_TIME, 4.7)
+
+        controller.cache_response(request, response, b"body")
+
+        stored = msgpack.loads(cache.get(url)[5:], raw=False)
+        assert stored["age"] == {
+            "corrected_initial_age": 15,
+            "response_monotonic_time": None,
+            "response_wall_time": 1004.0,
+            "record_id": ANY,
+            "time_base": "wall-clock",
+        }
+        assert "Age" not in stored["response"]["headers"]
+
+        clock["wall"] = 1000.0
+        clock["monotonic"] = 9.7
+        hit = controller.cached_request(request)
+        assert hit.headers["Age"] == "20"
+        assert remaining_freshness(hit) == 80
+        assert controller._current_age(hit, hit.headers, 1000) == 20
+
+        clock["wall"] = 1009.0
+        clock["monotonic"] = 500.7
+        restored = CacheController(cache)
+        restored_hit = restored.cached_request(request)
+        assert restored_hit.headers["Age"] == "20"
+        assert remaining_freshness(restored_hit) == 80
+        assert restored._current_age(restored_hit, restored_hit.headers, 1000) == 20
+
+        clock["wall"] = 1000.0
+        rollback_hit = restored.cached_request(request)
+        assert rollback_hit.headers["Age"] == "15"
+        assert remaining_freshness(rollback_hit) == 85
+
+        clock["wall"] = 1054.7
+        clock["monotonic"] = 44.7
+        revalidation_request = DummyRequest(
+            url=url, headers={"Cache-Control": "max-age=0"}
+        )
+        assert not restored.cached_request(revalidation_request)
+
+        validated = DummyResponse(
+            304,
+            {
+                "Date": time.strftime(TIME_FMT, time.gmtime(1050)),
+                "Age": "40",
+                "Cache-Control": "max-age=100",
+                "ETag": '"v1"',
+            },
+        )
+        setattr(revalidation_request, AGE_REQUEST_WALL_TIME, 1050.0)
+        setattr(revalidation_request, AGE_REQUEST_MONOTONIC_TIME, 40.0)
+        setattr(validated, AGE_RESPONSE_WALL_TIME, 1054.7)
+        setattr(validated, AGE_RESPONSE_MONOTONIC_TIME, 44.7)
+
+        updated = restored.update_cached_response(revalidation_request, validated)
+        assert updated.headers["Age"] == "45"
+        assert remaining_freshness(updated) == 55
+
+        validated_stored = msgpack.loads(cache.get(url)[5:], raw=False)
+        assert validated_stored["age"]["corrected_initial_age"] == 45
+        assert validated_stored["age"]["response_wall_time"] == 1054.7
+        assert "Age" not in validated_stored["response"]["headers"]
+
+        clock["wall"] = 1059.7
+        after_restore = CacheController(cache)
+        validated_hit = after_restore.cached_request(request)
+        assert validated_hit.headers["Age"] == "50"
+        assert remaining_freshness(validated_hit) == 50
+        assert (
+            after_restore._current_age(
+                validated_hit, validated_hit.headers, 1050
+            )
+            == 50
+        )
+
+        clock["wall"] = 1069.7
+        repeated_hit = CacheController(cache).cached_request(request)
+        assert repeated_hit.headers["Age"] == "60"
+        assert remaining_freshness(repeated_hit) == 40
+
+        final_stored = msgpack.loads(cache.get(url)[5:], raw=False)
+        assert final_stored["age"]["corrected_initial_age"] == 45
+        assert "Age" not in final_stored["response"]["headers"]
+
+    @pytest.mark.parametrize("age", ["-1", "not-a-number"])
+    def test_invalid_age_does_not_extend_freshness(self, monkeypatch, age):
+        monkeypatch.setattr(time, "time", lambda: 1004.0)
+        response = DummyResponse(
+            200,
+            headers={
+                "Date": time.strftime(TIME_FMT, time.gmtime(1000)),
+                "Age": age,
+                "Cache-Control": "max-age=1",
+            },
+        )
+        request = DummyRequest(url=self.url, headers={})
+        self.c.cache_response(request, response, b"body")
+
+        assert not self.c.cached_request(request)

@@ -4,14 +4,24 @@
 from __future__ import annotations
 
 import functools
+import time
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
 
 from requests.adapters import HTTPAdapter
 
+from cachecontrol._age import (
+    AGE_REQUEST_MONOTONIC_TIME,
+    AGE_REQUEST_WALL_TIME,
+    AGE_RESPONSE_MONOTONIC_TIME,
+    AGE_RESPONSE_WALL_TIME,
+)
 from cachecontrol.cache import DictCache
-from cachecontrol.controller import PERMANENT_REDIRECT_STATUSES, CacheController
+from cachecontrol.controller import (
+    PERMANENT_REDIRECT_STATUSES,
+    CacheController,
+)
 from cachecontrol.filewrapper import CallbackFileWrapper
 
 if TYPE_CHECKING:
@@ -73,7 +83,24 @@ class CacheControlAdapter(HTTPAdapter):
             # check for etags and add headers if appropriate
             request.headers.update(self.controller.conditional_headers(request))
 
+        request_sent_wall_time = time.time()
+        request_sent_monotonic_time = time.monotonic()
+        setattr(request, AGE_REQUEST_WALL_TIME, request_sent_wall_time)
+        setattr(
+            request,
+            AGE_REQUEST_MONOTONIC_TIME,
+            request_sent_monotonic_time,
+        )
         resp = super().send(request, stream, timeout, verify, cert, proxies)
+        response_received_wall_time = time.time()
+        response_received_monotonic_time = time.monotonic()
+
+        setattr(resp, AGE_RESPONSE_WALL_TIME, response_received_wall_time)
+        setattr(
+            resp,
+            AGE_RESPONSE_MONOTONIC_TIME,
+            response_received_monotonic_time,
+        )
 
         return resp
 
