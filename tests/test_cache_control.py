@@ -92,6 +92,46 @@ class TestCacheControllerResponse:
         cc.serializer.dumps.assert_called_with(req, resp, None)
         cc.cache.set.assert_called_with(self.url, ANY, expires=3600)
 
+    def test_cache_response_storage_includes_stale_if_error_window(self):
+        now = time.strftime(TIME_FMT, time.gmtime())
+        cc = CacheController(Mock(), serializer=Mock(), stale_if_error=True)
+        resp = self.resp(
+            {"cache-control": "max-age=60, stale-if-error=100", "date": now}
+        )
+
+        cc.cache_response(self.req(), resp)
+
+        cc.cache.set.assert_called_with(self.url, ANY, expires=160)
+
+    def test_cache_response_storage_honors_client_stale_if_error_limit(self):
+        now = time.strftime(TIME_FMT, time.gmtime())
+        cc = CacheController(Mock(), serializer=Mock(), stale_if_error=50)
+        resp = self.resp(
+            {"cache-control": "max-age=60, stale-if-error=100", "date": now}
+        )
+
+        cc.cache_response(self.req(), resp)
+
+        cc.cache.set.assert_called_with(self.url, ANY, expires=110)
+
+    @pytest.mark.parametrize(
+        "cache_control",
+        [
+            "max-age=60, stale-if-error=100, must-revalidate",
+            "max-age=60, stale-if-error=100, no-cache",
+        ],
+    )
+    def test_cache_response_storage_does_not_extend_revalidation_responses(
+        self, cache_control
+    ):
+        now = time.strftime(TIME_FMT, time.gmtime())
+        cc = CacheController(Mock(), serializer=Mock(), stale_if_error=True)
+        resp = self.resp({"cache-control": cache_control, "date": now})
+
+        cc.cache_response(self.req(), resp)
+
+        cc.cache.set.assert_called_with(self.url, ANY, expires=60)
+
     def test_cache_response_cache_max_age_with_invalid_value_not_cached(self, cc):
         now = time.strftime(TIME_FMT, time.gmtime())
         # Not a valid header; this would be from a misconfigured server

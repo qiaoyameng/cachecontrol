@@ -77,5 +77,31 @@ The `FileCache` will create a directory called `.webcache` and store a
 file for each cached request.
 
 
+Stale Responses on Errors
+=========================
+
+Pass ``stale_if_error=True`` to serve an explicitly authorized stale
+response when the server responds with a retryable error status or the
+connection fails: ::
+
+  sess = CacheControl(
+      requests.Session(),
+      stale_if_error=True,
+  )
+
+The response must include a ``stale-if-error`` cache-control directive.
+An integer value, or the same directive on the request, can only narrow
+the response's stale window: ::
+
+  sess = CacheControl(
+      requests.Session(),
+      stale_if_error=60,
+  )
+
+Stale responses are not served for authentication failures, caller
+cancellation, ``no-store``, ``no-cache``, or ``must-revalidate``
+constraints. When a stale response is used, ``response.from_cache`` is
+``True`` and ``response.cache_hit_reason`` is ``"stale-if-error"``.
+
 
 .. _Transport Adapter: http://docs.python-requests.org/en/latest/user/advanced/#transport-adapters

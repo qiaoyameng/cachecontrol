@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+STALE_IF_ERROR_STATUS_CODES = (500, 502, 503, 504)
+
+CACHE_HIT_REASON_FRESH = "fresh"
+CACHE_HIT_REASON_VALIDATED = "validated"
+CACHE_HIT_REASON_STALE_IF_ERROR = "stale-if-error"
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -56,11 +61,17 @@ class CacheController:
         cache_etags: bool = True,
         serializer: Serializer | None = None,
         status_codes: Collection[int] | None = None,
+        stale_if_error: bool | int = False,
+        stale_if_error_status_codes: Collection[int] | None = None,
     ):
         self.cache = DictCache() if cache is None else cache
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
         self.cacheable_status_codes = status_codes or (200, 203, 300, 301, 308)
+        self.stale_if_error = stale_if_error
+        self.stale_if_error_status_codes = (
+            stale_if_error_status_codes or STALE_IF_ERROR_STATUS_CODES
+        )
 
     @classmethod
     def _urlnorm(cls, uri: str) -> str:
@@ -101,6 +112,7 @@ class CacheController:
             "private": (None, False),
             "proxy-revalidate": (None, False),
             "s-maxage": (int, True),
+            "stale-if-error": (int, False),
         }
 
         cc_headers = headers.get("cache-control", headers.get("Cache-Control", ""))
@@ -166,7 +178,75 @@ class CacheController:
             logger.debug("Cache entry deserialization failed, entry ignored")
         return result
 
-    def cached_request(self, request: PreparedRequest) -> HTTPResponse | Literal[False]:
+    def _stale_if_error_limit(
+        self,
+        request_cc: dict[str, int | None],
+        response_cc: dict[str, int | None],
+    ) -> int | None:
+        if self.stale_if_error is False:
+            return None
+
+        response_delta = response_cc.get("stale-if-error")
+        if response_delta is None or response_delta < 0:
+            return None
+
+        limits: list[int] = [response_delta]
+
+        if isinstance(self.stale_if_error, int) and not isinstance(
+            self.stale_if_error, bool
+        ):
+            if self.stale_if_error < 0:
+                return None
+            limits.append(self.stale_if_error)
+
+        request_delta = request_cc.get("stale-if-error")
+        if request_delta is not None and request_delta >= 0:
+            limits.append(request_delta)
+
+        if not limits:
+            return None
+
+        return min(limits)
+
+    def _stale_if_error_storage_extension(
+        self,
+        request_cc: dict[str, int | None],
+        response_cc: dict[str, int | None],
+    ) -> int | None:
+        if self.stale_if_error is False:
+            return None
+
+        if "no-store" in request_cc or "no-cache" in request_cc:
+            return None
+
+        delta = response_cc.get("stale-if-error")
+        if delta is None or delta < 0:
+            return None
+        if "no-store" in response_cc or "no-cache" in response_cc:
+            return None
+        if "must-revalidate" in response_cc:
+            return None
+
+        limits: list[int] = [delta]
+        if isinstance(self.stale_if_error, int) and not isinstance(
+            self.stale_if_error, bool
+        ):
+            if self.stale_if_error < 0:
+                return None
+            limits.append(self.stale_if_error)
+
+        request_delta = request_cc.get("stale-if-error")
+        if request_delta is not None and request_delta >= 0:
+            limits.append(request_delta)
+
+        if not limits:
+            return None
+
+        return min(limits)
+
+    def cached_request(
+        self, request: PreparedRequest, *, stale_on_error: bool = False
+    ) -> HTTPResponse | Literal[False]:
         """
         Return a cached response if it exists in the cache, otherwise
         return False.
@@ -179,6 +259,10 @@ class CacheController:
         # Bail out if the request insists on fresh data
         if "no-cache" in cc:
             logger.debug('Request header has "no-cache", cache bypassed')
+            return False
+
+        if "no-store" in cc:
+            logger.debug('Request header has "no-store", cache bypassed')
             return False
 
         if "max-age" in cc and cc["max-age"] == 0:
@@ -264,16 +348,43 @@ class CacheController:
             logger.debug("%i > %i", freshness_lifetime, current_age)
             return resp
 
+        stale_if_error_limit = self._stale_if_error_limit(cc, resp_cc)
+        can_use_stale_on_error = (
+            stale_if_error_limit is not None
+            and "no-store" not in resp_cc
+            and "no-cache" not in resp_cc
+            and "must-revalidate" not in resp_cc
+        )
+        if stale_on_error and can_use_stale_on_error:
+            if current_age <= freshness_lifetime + stale_if_error_limit:
+                logger.debug('The response is stale, but usable with "stale-if-error"')
+                return resp
+            logger.debug('The cached response is stale beyond "stale-if-error" window')
+
         # we're not fresh. If we don't have an Etag, clear it out
-        if "etag" not in headers:
+        if "etag" not in headers and not can_use_stale_on_error:
             logger.debug('The cached response is "stale" with no etag, purging')
             self.cache.delete(cache_url)
 
         # return the original handler
         return False
 
+    def stale_if_error_request(
+        self, request: PreparedRequest
+    ) -> HTTPResponse | Literal[False]:
+        return self.cached_request(request, stale_on_error=True)
+
     def conditional_headers(self, request: PreparedRequest) -> dict[str, str]:
-        resp = self._load_from_cache(request)
+        if "no-store" in self.parse_cache_control(request.headers):
+            return {}
+
+        try:
+            resp = self._load_from_cache(request)
+        except Exception:
+            logger.debug(
+                "Ignoring conditional headers because cache could not be loaded"
+            )
+            return {}
         new_headers = {}
 
         if resp:
@@ -433,11 +544,18 @@ class CacheController:
             if time_tuple is None:
                 return
             date = calendar.timegm(time_tuple[:6])
+            stale_if_error_extension = self._stale_if_error_storage_extension(
+                cc_req, cc
+            )
             # cache when there is a max-age > 0
             max_age = cc.get("max-age")
             if max_age is not None and max_age > 0:
                 logger.debug("Caching b/c date exists and max-age > 0")
-                expires_time = max_age
+                expires_time = (
+                    max_age + stale_if_error_extension
+                    if stale_if_error_extension is not None
+                    else max_age
+                )
                 self._cache_set(
                     cache_url,
                     request,
@@ -457,6 +575,8 @@ class CacheController:
                         expires_time = 0
                     else:
                         expires_time = calendar.timegm(expires[:6]) - date
+                    if stale_if_error_extension is not None and expires_time > 0:
+                        expires_time += stale_if_error_extension
 
                     # A non-positive lifetime here means the response arrived
                     # stale

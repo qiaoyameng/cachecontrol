@@ -23,6 +23,8 @@ def CacheControl(
     cache_etags: bool = True,
     serializer: Serializer | None = None,
     heuristic: BaseHeuristic | None = None,
+    stale_if_error: bool | int = False,
+    stale_if_error_status_codes: Collection[int] | None = None,
     controller_class: type[CacheController] | None = None,
     adapter_class: type[CacheControlAdapter] | None = None,
     cacheable_methods: Collection[str] | None = None,
@@ -34,6 +36,8 @@ def CacheControl(
         cache_etags=cache_etags,
         serializer=serializer,
         heuristic=heuristic,
+        stale_if_error=stale_if_error,
+        stale_if_error_status_codes=stale_if_error_status_codes,
         controller_class=controller_class,
         cacheable_methods=cacheable_methods,
     )
