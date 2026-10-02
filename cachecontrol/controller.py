@@ -9,17 +9,20 @@ The httplib2 algorithms ported for use with requests.
 from __future__ import annotations
 
 import calendar
+import hashlib
+import io
 import logging
 import re
+import threading
 import time
 import weakref
 from email.utils import parsedate_tz
-from typing import TYPE_CHECKING, Collection, Mapping
+from typing import TYPE_CHECKING, Any, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
 
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
-from cachecontrol.serialize import Serializer
+from cachecontrol.serialize import Serializer, parse_vary_headers, vary_identity
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -34,6 +37,20 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+VARIANT_INDEX_SUFFIX = "#cachecontrol-variants"
+VARIANT_KEY_PREFIX = "#cachecontrol-variant:"
+
+
+class _CacheEntry:
+    def __init__(
+        self,
+        key: str,
+        response: HTTPResponse,
+        identity: dict[str, str | None],
+    ) -> None:
+        self.key = key
+        self.response = response
+        self.identity = identity
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -56,11 +73,16 @@ class CacheController:
         cache_etags: bool = True,
         serializer: Serializer | None = None,
         status_codes: Collection[int] | None = None,
+        max_variants: int = 16,
     ):
         self.cache = DictCache() if cache is None else cache
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
         self.cacheable_status_codes = status_codes or (200, 203, 300, 301, 308)
+        if max_variants < 1:
+            raise ValueError("max_variants must be at least 1")
+        self.max_variants = max_variants
+        self._variants_lock = threading.RLock()
 
     @classmethod
     def _urlnorm(cls, uri: str) -> str:
@@ -85,6 +107,297 @@ class CacheController:
     @classmethod
     def cache_url(cls, uri: str) -> str:
         return cls._urlnorm(uri)
+
+    @staticmethod
+    def _variant_index_key(cache_url: str) -> str:
+        return cache_url + VARIANT_INDEX_SUFFIX
+
+    @staticmethod
+    def _variant_key(cache_url: str, identity: Mapping[str, str | None]) -> str:
+        raw = "\n".join(f"{key}={value!r}" for key, value in identity.items())
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        return cache_url + VARIANT_KEY_PREFIX + digest
+
+    def _load_index(self, cache_url: str) -> dict[str, Any] | None:
+        data = self.cache.get(self._variant_index_key(cache_url))
+        if not isinstance(data, (bytes, bytearray)):
+            return None
+        index = self.serializer.loads_index(data)
+        if not isinstance(index, dict):
+            logger.debug("Variant index deserialization failed, entry ignored")
+            return None
+        return index
+
+    @staticmethod
+    def _index_identity(variant: Mapping[str, Any]) -> dict[str, str | None]:
+        identity = variant.get("identity", {})
+        return (
+            {str(key): value for key, value in identity.items()}
+            if isinstance(identity, dict)
+            else {}
+        )
+
+    def _identity_matches(
+        self,
+        identity: Mapping[str, str | None],
+        request: PreparedRequest,
+    ) -> bool:
+        return all(
+            request.headers.get(header, None) == value
+            for header, value in identity.items()
+        )
+
+    def _load_entry_unchecked(
+        self,
+        key: str,
+        identity: Mapping[str, str | None],
+        request: PreparedRequest,
+    ) -> _CacheEntry | None:
+        cache_data = self.cache.get(key)
+        if cache_data is None:
+            return None
+
+        if isinstance(self.cache, SeparateBodyBaseCache):
+            body_file = self.cache.get_body(key)
+        else:
+            body_file = None
+
+        result = self.serializer.loads(request, cache_data, body_file)
+        if result is None:
+            return None
+        return _CacheEntry(key, result, dict(identity))
+
+    def _touch_index(self, cache_url: str, index: dict[str, Any], key: str) -> None:
+        variants = index["variants"]
+        variants.sort(key=lambda variant: variant.get("key") != key, reverse=True)
+        self._write_index(cache_url, index)
+
+    def _load_cache_entry(self, request: PreparedRequest) -> _CacheEntry | None:
+        assert request.url is not None
+        cache_url = self.cache_url(request.url)
+        assert cache_url is not None
+        index = self._load_index(cache_url)
+
+        if index is not None:
+            for variant in index["variants"]:
+                key = variant.get("key")
+                if not isinstance(key, str):
+                    continue
+                identity = self._index_identity(variant)
+                if self._identity_matches(identity, request):
+                    entry = self._load_entry_unchecked(key, identity, request)
+                    if entry is not None:
+                        self._touch_index(cache_url, index, key)
+                        return entry
+                    variants = [
+                        variant
+                        for variant in index["variants"]
+                        if variant.get("key") != key
+                    ]
+                    if variants:
+                        index["variants"] = variants
+                        self._write_index(cache_url, index)
+                    else:
+                        self._delete_variant_group(cache_url, index)
+                    return None
+            return None
+
+        cache_data = self.cache.get(cache_url)
+        if cache_data is None:
+            return None
+        if isinstance(cache_data, (bytes, bytearray)):
+            cached_vary = self.serializer.loads_vary(cache_data)
+            if cached_vary is None:
+                return None
+        else:
+            cached_vary = {}
+        if not self._identity_matches(cached_vary, request):
+            return None
+
+        if isinstance(self.cache, SeparateBodyBaseCache):
+            body_file = self.cache.get_body(cache_url)
+        else:
+            body_file = None
+        result = self.serializer.loads(request, cache_data, body_file)
+        if result is None:
+            return None
+        return _CacheEntry(cache_url, result, cached_vary)
+
+    def _delete_cache_key(self, key: str) -> None:
+        self.cache.delete(key)
+
+    def _delete_variant_group(self, cache_url: str, index: dict[str, Any]) -> None:
+        for variant in index.get("variants", []):
+            key = variant.get("key")
+            if isinstance(key, str):
+                self._delete_cache_key(key)
+        self._delete_cache_key(self._variant_index_key(cache_url))
+
+    def invalidate_cache(self, cache_url: str) -> None:
+        with self._variants_lock:
+            index = self._load_index(cache_url)
+            if index is not None:
+                self._delete_variant_group(cache_url, index)
+            self._delete_cache_key(cache_url)
+
+    def _remove_cache_entry(self, cache_url: str, entry: _CacheEntry) -> None:
+        index = self._load_index(cache_url)
+        if index is None:
+            self._delete_cache_key(entry.key)
+            return
+
+        variants = [
+            variant
+            for variant in index["variants"]
+            if variant.get("key") != entry.key
+        ]
+        self._delete_cache_key(entry.key)
+        if variants:
+            index["variants"] = variants
+            self._write_index(cache_url, index)
+        else:
+            self._delete_cache_key(self._variant_index_key(cache_url))
+
+    def _invalidate_variants_for_direct_write(self, cache_url: str) -> None:
+        index = self._load_index(cache_url)
+        if index is not None:
+            self._delete_variant_group(cache_url, index)
+
+    @staticmethod
+    def _index_expires(index: Mapping[str, Any]) -> int | None:
+        expires_at = [
+            variant["expires_at"]
+            for variant in index["variants"]
+            if isinstance(variant, dict) and variant.get("expires_at") is not None
+        ]
+        if not expires_at:
+            return None
+        return max(1, int(max(expires_at) - time.time()))
+
+    def _write_index(self, cache_url: str, index: dict[str, Any]) -> None:
+        self.cache.set(
+            self._variant_index_key(cache_url),
+            self.serializer.dumps_index(index),
+            expires=self._index_expires(index),
+        )
+
+    def _write_cache_entry(
+        self,
+        key: str,
+        request: PreparedRequest,
+        response: HTTPResponse,
+        body: bytes | None,
+        expires_time: int | None,
+    ) -> None:
+        if isinstance(self.cache, SeparateBodyBaseCache):
+            metadata = self.serializer.dumps(request, response, b"")
+            self.cache.set(key, metadata, expires=expires_time)
+            if body is not None:
+                self.cache.set_body(key, body)
+        else:
+            metadata = self.serializer.dumps(request, response, body)
+            self.cache.set(key, metadata, expires=expires_time)
+
+    def _migrate_legacy_variant(
+        self,
+        cache_url: str,
+        index: dict[str, Any],
+        vary_headers: tuple[str, ...],
+    ) -> None:
+        cache_data = self.cache.get(cache_url)
+        if cache_data is None:
+            return
+        cached_vary = self.serializer.loads_vary(cache_data)
+        if not cached_vary:
+            return
+        key = self._variant_key(cache_url, cached_vary)
+        legacy_body = None
+        if isinstance(self.cache, SeparateBodyBaseCache):
+            body_file = self.cache.get_body(cache_url)
+            if body_file is not None:
+                legacy_body = body_file.read()
+
+        self.cache.set(key, cache_data)
+        if legacy_body is not None:
+            self.cache.set_body(key, legacy_body)
+        index["variants"].append(
+            {
+                "key": key,
+                "identity": cached_vary,
+                "expires_at": None,
+                "accessed": time.monotonic(),
+            }
+        )
+        self._delete_cache_key(cache_url)
+
+    def _set_variant(
+        self,
+        cache_url: str,
+        request: PreparedRequest,
+        response: HTTPResponse,
+        body: bytes | None,
+        expires_time: int | None,
+        vary_headers: tuple[str, ...],
+    ) -> None:
+        identity = vary_identity(request, vary_headers)
+        key = self._variant_key(cache_url, identity)
+        index = self._load_index(cache_url)
+
+        if index is None:
+            index = {"vary": list(vary_headers), "variants": []}
+            legacy_data = self.cache.get(cache_url)
+            if legacy_data is not None:
+                if not isinstance(legacy_data, (bytes, bytearray)):
+                    self._delete_cache_key(cache_url)
+                    legacy_data = None
+                if legacy_data is not None:
+                    legacy_vary = self.serializer.loads_vary(legacy_data)
+                    if not legacy_vary:
+                        logger.debug("Unreadable legacy cache entry invalidated")
+                        self._delete_cache_key(cache_url)
+                    elif set(legacy_vary) != set(vary_headers):
+                        logger.debug(
+                            "Legacy variant invalidated due to changed Vary header set"
+                        )
+                        self._delete_cache_key(cache_url)
+                    else:
+                        self._migrate_legacy_variant(
+                            cache_url, index, vary_headers
+                        )
+        elif index.get("vary") != list(vary_headers):
+            logger.debug("Replacing variants due to changed Vary header set")
+            self._delete_variant_group(cache_url, index)
+            index = {"vary": list(vary_headers), "variants": []}
+
+        variants = index["variants"]
+        existing = next(
+            (variant for variant in variants if variant.get("key") == key), None
+        )
+        if existing is not None:
+            variants.remove(existing)
+
+        variants.append(
+            {
+                "key": key,
+                "identity": identity,
+                "expires_at": (
+                    None if expires_time is None else time.time() + expires_time
+                ),
+                "accessed": time.monotonic(),
+            }
+        )
+
+        while len(variants) > self.max_variants:
+            evicted = variants.pop(0)
+            evicted_key = evicted.get("key")
+            if isinstance(evicted_key, str):
+                logger.debug(
+                    "Evicting least recently used cache variant: %s", evicted_key
+                )
+                self._delete_cache_key(evicted_key)
+
+        self._write_cache_entry(key, request, response, body, expires_time)
+        self._write_index(cache_url, index)
 
     def parse_cache_control(self, headers: Mapping[str, str]) -> dict[str, int | None]:
         known_directives = {
@@ -149,22 +462,11 @@ class CacheController:
         if "Range" in request.headers:
             return None
 
-        cache_url = request.url
-        assert cache_url is not None
-        cache_data = self.cache.get(cache_url)
-        if cache_data is None:
-            logger.debug("No cache entry available")
-            return None
-
-        if isinstance(self.cache, SeparateBodyBaseCache):
-            body_file = self.cache.get_body(cache_url)
-        else:
-            body_file = None
-
-        result = self.serializer.loads(request, cache_data, body_file)
-        if result is None:
+        entry = self._load_cache_entry(request)
+        if entry is None:
             logger.debug("Cache entry deserialization failed, entry ignored")
-        return result
+            return None
+        return entry.response
 
     def cached_request(self, request: PreparedRequest) -> HTTPResponse | Literal[False]:
         """
@@ -186,9 +488,10 @@ class CacheController:
             return False
 
         # Check whether we can load the response from the cache:
-        resp = self._load_from_cache(request)
-        if not resp:
+        entry = self._load_cache_entry(request)
+        if not entry:
             return False
+        resp = entry.response
 
         # Apply normal freshness checks to every cached response. In the case
         # of permanent redirects, RFC 9110 sections 15.4.2 and 15.4.9 permit
@@ -201,7 +504,7 @@ class CacheController:
                 # Without date or etag, the cached response can never be used
                 # and should be deleted.
                 logger.debug("Purging cached response: no date or etag")
-                self.cache.delete(cache_url)
+                self._remove_cache_entry(cache_url, entry)
             logger.debug("Ignoring cached response: no date")
             return False
 
@@ -267,7 +570,7 @@ class CacheController:
         # we're not fresh. If we don't have an Etag, clear it out
         if "etag" not in headers:
             logger.debug('The cached response is "stale" with no etag, purging')
-            self.cache.delete(cache_url)
+            self._remove_cache_entry(cache_url, entry)
 
         # return the original handler
         return False
@@ -294,33 +597,31 @@ class CacheController:
         response: HTTPResponse,
         body: bytes | None = None,
         expires_time: int | None = None,
+        vary_headers: tuple[str, ...] | None = None,
     ) -> None:
         """Store the data in the cache.
         """
         if expires_time is not None and expires_time <= 0:
             # Already stale on arrival
             logger.debug("Purging cached response: expires in the past")
-            self.cache.delete(cache_url)
+            self.invalidate_cache(cache_url)
             return
 
-        if isinstance(self.cache, SeparateBodyBaseCache):
-            # We pass in the body separately; just put a placeholder empty
-            # string in the metadata.
-            self.cache.set(
-                cache_url,
-                self.serializer.dumps(request, response, b""),
-                expires=expires_time,
-            )
-            # body is None can happen when, for example, we're only updating
-            # headers, as is the case in update_cached_response().
-            if body is not None:
-                self.cache.set_body(cache_url, body)
-        else:
-            self.cache.set(
-                cache_url,
-                self.serializer.dumps(request, response, body),
-                expires=expires_time,
-            )
+        with self._variants_lock:
+            if vary_headers is None or not vary_headers:
+                self._invalidate_variants_for_direct_write(cache_url)
+                self._write_cache_entry(
+                    cache_url, request, response, body, expires_time
+                )
+            elif vary_headers:
+                self._set_variant(
+                    cache_url,
+                    request,
+                    response,
+                    body,
+                    expires_time,
+                    vary_headers,
+                )
 
     def cache_response(
         self,
@@ -390,18 +691,13 @@ class CacheController:
         if "no-store" in cc_req:
             no_store = True
             logger.debug('Request header has "no-store"')
-        if no_store and self.cache.get(cache_url):
-            logger.debug('Purging existing cache entry to honor "no-store"')
-            self.cache.delete(cache_url)
         if no_store:
+            logger.debug('Purging existing cache entry to honor "no-store"')
+            self.invalidate_cache(cache_url)
             return
 
-        # https://tools.ietf.org/html/rfc7234#section-4.1:
-        # A Vary header field-value of "*" always fails to match.
-        # Storing such a response leads to a deserialization warning
-        # during cache lookup and is not allowed to ever be served,
-        # so storing it can be avoided.
-        if "*" in response_headers.get("vary", ""):
+        vary_headers = parse_vary_headers(response_headers)
+        if vary_headers is None:
             logger.debug('Response header has "Vary: *"')
             return
 
@@ -417,13 +713,22 @@ class CacheController:
 
             logger.debug(f"etag object cached for {expires_time} seconds")
             logger.debug("Caching due to etag")
-            self._cache_set(cache_url, request, response, body, expires_time)
+            self._cache_set(
+                cache_url,
+                request,
+                response,
+                body,
+                expires_time,
+                vary_headers,
+            )
 
         # Add to the cache any permanent redirects. We do this before looking
         # that the Date headers.
         elif int(response.status) in PERMANENT_REDIRECT_STATUSES:
             logger.debug("Caching permanent redirect")
-            self._cache_set(cache_url, request, response, b"")
+            self._cache_set(
+                cache_url, request, response, b"", vary_headers=vary_headers
+            )
 
         # Add to the cache if the response headers demand it. If there
         # is no date header then we can't do anything about expiring
@@ -444,6 +749,7 @@ class CacheController:
                     response,
                     body,
                     expires_time,
+                    vary_headers,
                 )
 
             # If the request can expire, it means we should cache it
@@ -471,6 +777,7 @@ class CacheController:
                         response,
                         body,
                         expires_time,
+                        vary_headers,
                     )
 
     def update_cached_response(
@@ -484,10 +791,28 @@ class CacheController:
         """
         assert request.url is not None
         cache_url = self.cache_url(request.url)
-        cached_response = self._load_from_cache(request)
+        cached_entry = self._load_cache_entry(request)
 
-        if not cached_response:
+        if not cached_entry:
             # we didn't have a cached response
+            return response
+        cached_response = cached_entry.response
+
+        new_response_headers = CaseInsensitiveDict(response.headers)
+        if "vary" in new_response_headers:
+            new_vary_headers = parse_vary_headers(new_response_headers)
+        else:
+            new_vary_headers = tuple(sorted(cached_entry.identity))
+
+        old_vary_headers = tuple(sorted(cached_entry.identity))
+        variant_group_changed = new_vary_headers is not None and (
+            new_vary_headers != old_vary_headers
+        )
+        cached_body = cached_response.read(decode_content=False)
+        cached_response._fp = io.BytesIO(cached_body)  # type: ignore[assignment]
+        cached_response.length_remaining = len(cached_body)
+        if new_vary_headers is None:
+            self.invalidate_cache(cache_url)
             return response
 
         # Lets update our headers with the headers from the new request:
@@ -511,6 +836,14 @@ class CacheController:
         cached_response.status = 200
 
         # update our cache
-        self._cache_set(cache_url, request, cached_response)
+        self._cache_set(
+            cache_url,
+            request,
+            cached_response,
+            cached_body,
+            vary_headers=new_vary_headers,
+        )
+        cached_response._fp = io.BytesIO(cached_body)  # type: ignore[assignment]
+        cached_response.length_remaining = len(cached_body)
 
         return cached_response

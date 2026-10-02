@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import io
-from typing import IO, TYPE_CHECKING, Any, Mapping, cast
+from typing import IO, TYPE_CHECKING, Any, Collection, Mapping, cast
 
 import msgpack
 from requests.structures import CaseInsensitiveDict
@@ -14,8 +14,41 @@ if TYPE_CHECKING:
     from requests import PreparedRequest
 
 
+def parse_vary_headers(headers: Mapping[str, str]) -> tuple[str, ...] | None:
+    """Return the normalized set of headers named by ``Vary``.
+
+    ``None`` means ``Vary: *`` and therefore identifies no cacheable variant.
+    """
+    value = headers.get("vary", headers.get("Vary", ""))
+    fields = {
+        field.strip().lower()
+        for field in value.split(",")
+        if field.strip()
+    }
+    if "*" in fields:
+        return None
+    return tuple(sorted(fields))
+
+
+def vary_identity(
+    request: PreparedRequest, vary_headers: Collection[str]
+) -> dict[str, str | None]:
+    """Build the selecting request-header identity for a cached variant."""
+    return {
+        header.lower(): _request_header_value(request, header)
+        for header in sorted(vary_headers, key=str.lower)
+    }
+
+
+def _request_header_value(request: PreparedRequest, header: str) -> str | None:
+    value = request.headers.get(header, None)
+    return None if value is None else str(value)
+
+
 class Serializer:
     serde_version = "4"
+    index_version = 1
+    index_prefix = b"ccv=1,"
 
     def dumps(
         self,
@@ -46,16 +79,10 @@ class Serializer:
             }
         }
 
-        # Construct our vary headers
-        data["vary"] = {}
-        if "vary" in response_headers:
-            varied_headers = response_headers["vary"].split(",")
-            for header in varied_headers:
-                header = str(header).strip()
-                header_value = request.headers.get(header, None)
-                if header_value is not None:
-                    header_value = str(header_value)
-                data["vary"][header] = header_value
+        vary_headers = parse_vary_headers(response_headers)
+        data["vary"] = (
+            {} if vary_headers is None else vary_identity(request, vary_headers)
+        )
 
         return b",".join([f"cc={self.serde_version}".encode(), self.serialize(data)])
 
@@ -77,8 +104,69 @@ class Serializer:
         if not data.startswith(f"cc={self.serde_version},".encode()):
             return None
 
-        data = data[5:]
+        data = data[len(f"cc={self.serde_version},"):]
         return self._loads_v4(request, data, body_file)
+
+    def dumps_index(self, index: Mapping[str, Any]) -> bytes:
+        return self.index_prefix + msgpack.dumps(
+            {"version": self.index_version, **dict(index)}, use_bin_type=True
+        )
+
+    def loads_index(self, data: bytes) -> dict[str, Any] | None:
+        if not data or not data.startswith(self.index_prefix):
+            return None
+        try:
+            index = msgpack.loads(data[len(self.index_prefix) :], raw=False)
+        except ValueError:
+            return None
+        if (
+            not isinstance(index, dict)
+            or index.get("version") != self.index_version
+        ):
+            return None
+        vary = index.get("vary")
+        variants = index.get("variants")
+        if not isinstance(vary, list) or not all(
+            isinstance(x, str) for x in vary
+        ):
+            return None
+        if not isinstance(variants, list):
+            return None
+        for variant in variants:
+            if not isinstance(variant, dict):
+                return None
+            identity = variant.get("identity")
+            if not isinstance(identity, dict):
+                return None
+            if not all(
+                isinstance(key, str)
+                and (value is None or isinstance(value, str))
+                for key, value in identity.items()
+            ):
+                return None
+            if not isinstance(variant.get("key"), str):
+                return None
+        return index
+
+    def loads_vary(self, data: bytes) -> dict[str, str | None] | None:
+        """Return the selecting request headers stored in a cached response."""
+        prefix = f"cc={self.serde_version},".encode()
+        if not data or not data.startswith(prefix):
+            return None
+
+        try:
+            cached = msgpack.loads(data[len(prefix) :], raw=False)
+        except ValueError:
+            return None
+
+        vary = cached.get("vary")
+        if not isinstance(vary, dict):
+            return {}
+        return {
+            str(key).lower(): value
+            for key, value in vary.items()
+            if key and (value is None or isinstance(value, str))
+        }
 
     def prepare_response(
         self,
@@ -99,7 +187,7 @@ class Serializer:
         # Ensure that the Vary headers for the cached response match our
         # request
         for header, value in cached.get("vary", {}).items():
-            if request.headers.get(header, None) != value:
+            if request.headers.get(header.lower(), None) != value:
                 return None
 
         body_raw = cached["response"].pop("body")

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
@@ -34,6 +35,7 @@ class CacheControlAdapter(HTTPAdapter):
         serializer: Serializer | None = None,
         heuristic: BaseHeuristic | None = None,
         cacheable_methods: Collection[str] | None = None,
+        max_variants: int = 16,
         *args: Any,
         **kw: Any,
     ) -> None:
@@ -43,9 +45,19 @@ class CacheControlAdapter(HTTPAdapter):
         self.cacheable_methods = cacheable_methods or ("GET",)
 
         controller_factory = controller_class or CacheController
-        self.controller = controller_factory(
-            self.cache, cache_etags=cache_etags, serializer=serializer
+        controller_kwargs = {
+            "cache_etags": cache_etags,
+            "serializer": serializer,
+        }
+        parameters = inspect.signature(controller_factory).parameters
+        accepts_variant_limit = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "max_variants"
+            for parameter in parameters.values()
         )
+        if accepts_variant_limit:
+            controller_kwargs["max_variants"] = max_variants
+        self.controller = controller_factory(self.cache, **controller_kwargs)
 
     def send(
         self,
@@ -159,7 +171,7 @@ class CacheControlAdapter(HTTPAdapter):
         if request.method in self.invalidating_methods and resp.ok:
             assert request.url is not None
             cache_url = self.controller.cache_url(request.url)
-            self.cache.delete(cache_url)
+            self.controller.invalidate_cache(cache_url)
 
         # Give the request a from_cache attr to let people use it
         resp.from_cache = from_cache  # type: ignore[attr-defined]
