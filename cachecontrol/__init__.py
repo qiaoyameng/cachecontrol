@@ -11,6 +11,13 @@ import importlib.metadata
 
 from cachecontrol.adapter import CacheControlAdapter
 from cachecontrol.controller import CacheController
+from cachecontrol.exceptions import (
+    CacheControlError,
+    CachedResponseUnavailableError,
+    NotCachedError,
+    NotInCacheError,
+    OnlyIfCachedError,
+)
 from cachecontrol.wrapper import CacheControl
 
 __author__ = "Eric Larson"
@@ -24,6 +31,11 @@ __all__ = [
     "CacheControlAdapter",
     "CacheController",
     "CacheControl",
+    "CacheControlError",
+    "OnlyIfCachedError",
+    "NotInCacheError",
+    "NotCachedError",
+    "CachedResponseUnavailableError",
 ]
 
 import logging

@@ -4,19 +4,22 @@
 from __future__ import annotations
 
 import functools
+import io
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
 
 from requests.adapters import HTTPAdapter
+from requests.structures import CaseInsensitiveDict
+from urllib3 import HTTPResponse
 
 from cachecontrol.cache import DictCache
 from cachecontrol.controller import PERMANENT_REDIRECT_STATUSES, CacheController
+from cachecontrol.exceptions import CacheControlError
 from cachecontrol.filewrapper import CallbackFileWrapper
 
 if TYPE_CHECKING:
     from requests import PreparedRequest, Response
-    from urllib3 import HTTPResponse
 
     from cachecontrol.cache import BaseCache
     from cachecontrol.heuristics import BaseHeuristic
@@ -67,6 +70,8 @@ class CacheControlAdapter(HTTPAdapter):
                 cached_response = self.controller.cached_request(request)
             except zlib.error:
                 cached_response = None
+            except CacheControlError as exc:
+                return self._build_gateway_timeout(request, exc)
             if cached_response:
                 return self.build_response(request, cached_response, from_cache=True)
 
@@ -76,6 +81,32 @@ class CacheControlAdapter(HTTPAdapter):
         resp = super().send(request, stream, timeout, verify, cert, proxies)
 
         return resp
+
+    def _build_gateway_timeout(
+        self,
+        request: PreparedRequest,
+        exc: CacheControlError,
+    ) -> Response:
+        message = b"Gateway Timeout"
+        raw = HTTPResponse(
+            body=io.BytesIO(message),
+            headers=CaseInsensitiveDict(
+                {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Content-Length": str(len(message)),
+                    "Cache-Control": "no-store",
+                }
+            ),
+            status=504,
+            version=0,
+            reason="Gateway Timeout",
+            preload_content=False,
+            request_method=request.method,
+            request_url=request.url,
+        )
+        response = HTTPAdapter.build_response(self, request, raw)
+        response.from_cache = False  # type: ignore[attr-defined]
+        return response
 
     def build_response(  # type: ignore[override]
         self,

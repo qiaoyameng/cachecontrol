@@ -13,12 +13,15 @@ import logging
 import re
 import time
 import weakref
+import zlib
+from dataclasses import dataclass
 from email.utils import parsedate_tz
 from typing import TYPE_CHECKING, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
 
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
+from cachecontrol.exceptions import CachedResponseUnavailableError, NotInCacheError
 from cachecontrol.serialize import Serializer
 
 if TYPE_CHECKING:
@@ -34,6 +37,12 @@ logger = logging.getLogger(__name__)
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
 PERMANENT_REDIRECT_STATUSES = (301, 308)
+
+
+@dataclass(frozen=True)
+class _CacheLookup:
+    response: HTTPResponse | None
+    entry_exists: bool
 
 
 def parse_uri(uri: str) -> tuple[str, str, str, str, str]:
@@ -144,27 +153,56 @@ class CacheController:
         """
         Load a cached response, or return None if it's not available.
         """
-        # We do not support caching of partial content: so if the request contains a
-        # Range header then we don't want to load anything from the cache.
-        if "Range" in request.headers:
-            return None
+        return self._lookup_cache(request).response
 
+    def _lookup_cache(self, request: PreparedRequest) -> _CacheLookup:
         cache_url = request.url
         assert cache_url is not None
         cache_data = self.cache.get(cache_url)
         if cache_data is None:
             logger.debug("No cache entry available")
-            return None
+            return _CacheLookup(None, False)
+
+        # We do not support caching of partial content: so if the request contains a
+        # Range header then the stored representation is not eligible for it.
+        if "Range" in request.headers:
+            return _CacheLookup(None, True)
 
         if isinstance(self.cache, SeparateBodyBaseCache):
             body_file = self.cache.get_body(cache_url)
         else:
             body_file = None
 
-        result = self.serializer.loads(request, cache_data, body_file)
+        try:
+            result = self.serializer.loads(request, cache_data, body_file)
+        except zlib.error:
+            logger.debug("Cache entry decompression failed, entry ignored")
+            return _CacheLookup(None, True)
         if result is None:
             logger.debug("Cache entry deserialization failed, entry ignored")
-        return result
+            return _CacheLookup(None, True)
+        return _CacheLookup(result, True)
+
+    @staticmethod
+    def _cache_unavailable(
+        response: HTTPResponse | None, reason: str, only_if_cached: bool
+    ) -> None:
+        if only_if_cached:
+            logger.debug(
+                "Cached response unavailable for only-if-cached request: %s", reason
+            )
+            raise CachedResponseUnavailableError(response, reason)
+        logger.debug("Ignoring cached response: %s", reason)
+
+    @staticmethod
+    def _only_if_cached_miss(lookup: _CacheLookup, only_if_cached: bool) -> None:
+        if not only_if_cached:
+            return
+        if lookup.entry_exists:
+            raise CachedResponseUnavailableError(
+                lookup.response, "stored cache entry could not be loaded"
+            )
+        raise NotInCacheError("no cache entry available")
 
     def cached_request(self, request: PreparedRequest) -> HTTPResponse | Literal[False]:
         """
@@ -176,18 +214,21 @@ class CacheController:
         logger.debug('Looking up "%s" in the cache', cache_url)
         cc = self.parse_cache_control(request.headers)
 
-        # Bail out if the request insists on fresh data
-        if "no-cache" in cc:
-            logger.debug('Request header has "no-cache", cache bypassed')
-            return False
+        only_if_cached = "only-if-cached" in cc
+        lookup = self._lookup_cache(request)
 
-        if "max-age" in cc and cc["max-age"] == 0:
-            logger.debug('Request header has "max_age" as 0, cache bypassed')
-            return False
-
-        # Check whether we can load the response from the cache:
-        resp = self._load_from_cache(request)
+        resp = lookup.response
         if not resp:
+            self._only_if_cached_miss(lookup, only_if_cached)
+            return False
+
+        if "no-cache" in cc:
+            self._cache_unavailable(
+                resp,
+                "request no-cache requires revalidation",
+                only_if_cached,
+            )
+            logger.debug('Request header has "no-cache", cache bypassed')
             return False
 
         # Apply normal freshness checks to every cached response. In the case
@@ -200,15 +241,26 @@ class CacheController:
             if "etag" not in headers:
                 # Without date or etag, the cached response can never be used
                 # and should be deleted.
+                if only_if_cached:
+                    raise CachedResponseUnavailableError(
+                        resp, "cached response has neither Date nor ETag"
+                    )
                 logger.debug("Purging cached response: no date or etag")
                 self.cache.delete(cache_url)
-            logger.debug("Ignoring cached response: no date")
+            else:
+                self._cache_unavailable(
+                    resp,
+                    "cached response has no Date and requires revalidation",
+                    only_if_cached,
+                )
             return False
 
         now = time.time()
         time_tuple = parsedate_tz(headers["date"])
         if time_tuple is None:
-            logger.debug("Ignoring cached response: invalid date")
+            self._cache_unavailable(
+                resp, "cached response has an invalid Date", only_if_cached
+            )
             return False
         date = calendar.timegm(time_tuple[:6])
         current_age = max(0, now - date)
@@ -221,36 +273,44 @@ class CacheController:
         resp_cc = self.parse_cache_control(headers)
 
         # determine freshness
-        freshness_lifetime = 0
+        freshness_lifetime: int | None = 0
+        has_explicit_freshness = False
 
         # Check the max-age pragma in the cache control header
         max_age = resp_cc.get("max-age")
-        if max_age is not None:
-            freshness_lifetime = max_age
-            logger.debug("Freshness lifetime from max-age: %i", freshness_lifetime)
+        if "max-age" in resp_cc:
+            has_explicit_freshness = True
+            if max_age is not None:
+                freshness_lifetime = max_age
+                logger.debug(
+                    "Freshness lifetime from max-age: %i", freshness_lifetime
+                )
 
         # If there isn't a max-age, check for an expires header
-        elif "expires" in headers:
+        elif headers.get("expires"):
+            has_explicit_freshness = True
             expires = parsedate_tz(headers["expires"])
             if expires is not None:
                 expire_time = calendar.timegm(expires[:6]) - date
                 freshness_lifetime = max(0, expire_time)
+                freshness_from_response = True
                 logger.debug("Freshness lifetime from expires: %i", freshness_lifetime)
 
-        # Permanent redirects are heuristically cacheable when the response
-        # does not provide an explicit freshness lifetime.
-        elif int(resp.status) in PERMANENT_REDIRECT_STATUSES:
-            logger.debug("Returning cached permanent redirect response")
-            return resp
-
-        # Determine if we are setting freshness limit in the
-        # request. Note, this overrides what was in the response.
+        # A request max-age overrides the response's freshness lifetime. A
+        # permanent redirect remains heuristically fresh only when neither the
+        # response nor the request specifies a freshness lifetime.
         max_age = cc.get("max-age")
         if max_age is not None:
             freshness_lifetime = max_age
             logger.debug(
                 "Freshness lifetime from request max-age: %i", freshness_lifetime
             )
+        elif (
+            not has_explicit_freshness
+            and int(resp.status) in PERMANENT_REDIRECT_STATUSES
+        ):
+            freshness_lifetime = None
+            logger.debug("Cached permanent redirect is heuristically fresh")
 
         min_fresh = cc.get("min-fresh")
         if min_fresh is not None:
@@ -259,17 +319,55 @@ class CacheController:
             logger.debug("Adjusted current age from min-fresh: %i", current_age)
 
         # Return entry if it is fresh enough
-        if freshness_lifetime > current_age:
+        if freshness_lifetime is None or freshness_lifetime > current_age:
             logger.debug('The response is "fresh", returning cached response')
-            logger.debug("%i > %i", freshness_lifetime, current_age)
+            if freshness_lifetime is None:
+                logger.debug("heuristic freshness > %i", current_age)
+            else:
+                logger.debug("%i > %i", freshness_lifetime, current_age)
+
+            response_no_cache = "no-cache" in resp_cc
+            if "no-cache" in cc or response_no_cache:
+                self._cache_unavailable(
+                    resp,
+                    "no-cache requires revalidation",
+                    only_if_cached,
+                )
+                return False
             return resp
 
-        # we're not fresh. If we don't have an Etag, clear it out
+        max_stale = cc.get("max-stale")
+        stale_age = current_age - (freshness_lifetime or 0)
+        stale_allowed = "max-stale" in cc and (
+            max_stale is None or stale_age <= max_stale
+        )
+        revalidation_required = (
+            "no-cache" in cc
+            or "no-cache" in resp_cc
+            or "must-revalidate" in resp_cc
+        )
+
+        if stale_allowed and not revalidation_required:
+            logger.debug(
+                'The response is "stale" but acceptable, returning cached response'
+            )
+            return resp
+
+        reason = "cached response is stale"
+        if "no-cache" in cc or "no-cache" in resp_cc:
+            reason = "no-cache requires revalidation"
+        elif "must-revalidate" in resp_cc:
+            reason = "must-revalidate forbids stale responses"
+        elif max_stale is not None:
+            reason = "cached response exceeds permitted staleness"
+
+        self._cache_unavailable(resp, reason, only_if_cached)
+
+        # We're not fresh. If we don't have an ETag, clear it out.
         if "etag" not in headers:
             logger.debug('The cached response is "stale" with no etag, purging')
             self.cache.delete(cache_url)
 
-        # return the original handler
         return False
 
     def conditional_headers(self, request: PreparedRequest) -> dict[str, str]:
