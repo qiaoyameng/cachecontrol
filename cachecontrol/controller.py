@@ -9,17 +9,19 @@ The httplib2 algorithms ported for use with requests.
 from __future__ import annotations
 
 import calendar
+import io
 import logging
 import re
 import time
 import weakref
 from email.utils import parsedate_tz
-from typing import TYPE_CHECKING, Collection, Mapping
+from threading import RLock
+from typing import IO, TYPE_CHECKING, Any, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
 
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
-from cachecontrol.serialize import Serializer
+from cachecontrol.serialize import Serializer, normalize_vary_fields
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -30,6 +32,8 @@ if TYPE_CHECKING:
     from cachecontrol.cache import BaseCache
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_VARIANTS = 16
 
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
@@ -56,11 +60,16 @@ class CacheController:
         cache_etags: bool = True,
         serializer: Serializer | None = None,
         status_codes: Collection[int] | None = None,
+        max_variants: int = DEFAULT_MAX_VARIANTS,
     ):
+        if max_variants < 1:
+            raise ValueError("max_variants must be at least 1")
         self.cache = DictCache() if cache is None else cache
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
         self.cacheable_status_codes = status_codes or (200, 203, 300, 301, 308)
+        self.max_variants = max_variants
+        self.variant_lock = RLock()
 
     @classmethod
     def _urlnorm(cls, uri: str) -> str:
@@ -85,6 +94,191 @@ class CacheController:
     @classmethod
     def cache_url(cls, uri: str) -> str:
         return cls._urlnorm(uri)
+
+    def _supports_variants(self) -> bool:
+        return all(
+            hasattr(self.serializer, method)
+            for method in ("is_index", "loads_index", "loads_record", "variant_id")
+        )
+
+    def _is_index(self, data: bytes | None) -> bool:
+        return isinstance(data, bytes) and data.startswith(Serializer.index_prefix)
+
+    def _loads_index(self, data: bytes) -> dict[str, Any] | None:
+        if not self._supports_variants() or not isinstance(data, bytes):
+            return None
+        return self.serializer.loads_index(data)
+
+    def _loads_record(self, data: Any) -> Mapping[str, Any] | None:
+        if not self._supports_variants():
+            return {"vary": {}}
+        if not isinstance(data, bytes):
+            return {"vary": {}}
+        return self.serializer.loads_record(data)
+
+    def _variant_id(
+        self, fields: tuple[str, ...], headers: Mapping[str, Any]
+    ) -> str:
+        return self.serializer.variant_id(fields, headers)
+
+    def _variant_key(self, cache_url: str, variant_id: str) -> str:
+        return f"{cache_url}#variants/{variant_id}"
+
+    def _load_index(self, cache_url: str) -> dict[str, Any] | None:
+        raw_index = self.cache.get(cache_url)
+        if raw_index is None:
+            return None
+
+        index = self._loads_index(raw_index)
+        if index is None:
+            return None
+
+        variants = []
+        for variant in index["variants"]:
+            variant_key = self._variant_key(cache_url, variant["id"])
+            if self.cache.get(variant_key) is None:
+                continue
+            if isinstance(self.cache, SeparateBodyBaseCache):
+                body_file = self.cache.get_body(variant_key)
+                if body_file is None:
+                    continue
+                body_file.close()
+            variants.append(variant)
+        if len(variants) != len(index["variants"]):
+            index["variants"] = variants
+            self._save_index(cache_url, index)
+        return index
+
+    def _save_index(self, cache_url: str, index: dict[str, Any]) -> None:
+        self.cache.set(
+            cache_url,
+            self.serializer.dumps_index(index["vary"], index["variants"]),
+        )
+
+    def _invalidate_url(self, cache_url: str) -> None:
+        with self.variant_lock:
+            index = self._load_index(cache_url)
+            if index is not None:
+                for variant in index["variants"]:
+                    self._delete_variant(cache_url, variant["id"])
+            self.cache.delete(cache_url)
+
+    def _delete_variant(self, cache_url: str, variant_id: str) -> None:
+        variant_key = self._variant_key(cache_url, variant_id)
+        self.cache.delete(variant_key)
+
+    def _remove_variant(
+        self, cache_url: str, index: dict[str, Any], variant_id: str
+    ) -> None:
+        self._delete_variant(cache_url, variant_id)
+        index["variants"] = [
+            variant
+            for variant in index["variants"]
+            if variant["id"] != variant_id
+        ]
+        if index["variants"]:
+            self._save_index(cache_url, index)
+        else:
+            self.cache.delete(cache_url)
+
+    def _invalidate_selected(
+        self, request: PreparedRequest, cache_url: str
+    ) -> None:
+        with self.variant_lock:
+            entry = self._load_cache_entry(request, cache_url)
+            if entry is None:
+                return
+            if entry["legacy"]:
+                self.cache.delete(cache_url)
+            else:
+                self._remove_variant(cache_url, entry["index"], entry["id"])
+
+    def _load_entry(
+        self,
+        request: PreparedRequest,
+        cache_url: str,
+        raw_entry: bytes | None,
+        body_file: IO[bytes] | None = None,
+    ) -> tuple[HTTPResponse | None, Mapping[str, Any] | None]:
+        if raw_entry is None:
+            return None, None
+        record = self._loads_record(raw_entry)
+        if isinstance(raw_entry, bytes) and raw_entry.startswith(
+            Serializer.index_prefix
+        ):
+            return None, None
+        return self.serializer.loads(request, raw_entry, body_file), record
+
+    def _load_cache_entry(
+        self, request: PreparedRequest, cache_url: str
+    ) -> dict[str, Any] | None:
+        with self.variant_lock:
+            raw = self.cache.get(cache_url)
+            if raw is None:
+                return None
+
+            if self._is_index(raw):
+                index = self._loads_index(raw)
+                if index is None:
+                    logger.debug("Invalid Vary index, purging")
+                    self._invalidate_url(cache_url)
+                    return None
+
+                current_id = self._variant_id(index["vary"], request.headers)
+                variant = next(
+                    (
+                        variant
+                        for variant in index["variants"]
+                        if variant["id"] == current_id
+                    ),
+                    None,
+                )
+                if variant is None:
+                    return None
+
+                variant_key = self._variant_key(cache_url, current_id)
+                raw_entry = self.cache.get(variant_key)
+                if raw_entry is None:
+                    self._remove_variant(cache_url, index, current_id)
+                    return None
+
+                body_file = None
+                if isinstance(self.cache, SeparateBodyBaseCache):
+                    body_file = self.cache.get_body(variant_key)
+                    if body_file is None:
+                        self._remove_variant(cache_url, index, current_id)
+                        return None
+
+                response, record = self._load_entry(
+                    request, variant_key, raw_entry, body_file
+                )
+                if response is None or record is None:
+                    self._remove_variant(cache_url, index, current_id)
+                    return None
+
+                return {
+                    "response": response,
+                    "key": variant_key,
+                    "id": current_id,
+                    "index": index,
+                    "legacy": False,
+                    "record": record,
+                }
+
+            body_file = None
+            if isinstance(self.cache, SeparateBodyBaseCache):
+                body_file = self.cache.get_body(cache_url)
+            response, record = self._load_entry(request, cache_url, raw, body_file)
+            if response is None:
+                return None
+            return {
+                "response": response,
+                "key": cache_url,
+                "id": None,
+                "index": None,
+                "legacy": True,
+                "record": record,
+            }
 
     def parse_cache_control(self, headers: Mapping[str, str]) -> dict[str, int | None]:
         known_directives = {
@@ -151,20 +345,11 @@ class CacheController:
 
         cache_url = request.url
         assert cache_url is not None
-        cache_data = self.cache.get(cache_url)
-        if cache_data is None:
+        entry = self._load_cache_entry(request, cache_url)
+        if entry is None:
             logger.debug("No cache entry available")
             return None
-
-        if isinstance(self.cache, SeparateBodyBaseCache):
-            body_file = self.cache.get_body(cache_url)
-        else:
-            body_file = None
-
-        result = self.serializer.loads(request, cache_data, body_file)
-        if result is None:
-            logger.debug("Cache entry deserialization failed, entry ignored")
-        return result
+        return entry["response"]
 
     def cached_request(self, request: PreparedRequest) -> HTTPResponse | Literal[False]:
         """
@@ -201,7 +386,7 @@ class CacheController:
                 # Without date or etag, the cached response can never be used
                 # and should be deleted.
                 logger.debug("Purging cached response: no date or etag")
-                self.cache.delete(cache_url)
+                self._invalidate_selected(request, cache_url)
             logger.debug("Ignoring cached response: no date")
             return False
 
@@ -267,7 +452,7 @@ class CacheController:
         # we're not fresh. If we don't have an Etag, clear it out
         if "etag" not in headers:
             logger.debug('The cached response is "stale" with no etag, purging')
-            self.cache.delete(cache_url)
+            self._invalidate_selected(request, cache_url)
 
         # return the original handler
         return False
@@ -321,6 +506,157 @@ class CacheController:
                 self.serializer.dumps(request, response, body),
                 expires=expires_time,
             )
+
+    def _migrate_legacy_variant(
+        self,
+        cache_url: str,
+        raw_entry: bytes,
+        record: Mapping[str, Any],
+        fields: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        lookup = CaseInsensitiveDict(data=dict(record.get("vary", {})))
+        identity = {field: lookup.get(field) for field in fields}
+        legacy_id = self._variant_id(fields, identity)
+
+        legacy_key = self._variant_key(cache_url, legacy_id)
+        legacy_body = None
+        if isinstance(self.cache, SeparateBodyBaseCache):
+            old_body = self.cache.get_body(cache_url)
+            if old_body is None:
+                return None
+            with old_body:
+                legacy_body = old_body.read()
+
+        self.cache.set(legacy_key, raw_entry)
+        if legacy_body is not None:
+            self.cache.set_body(legacy_key, legacy_body)
+
+        self.cache.delete(cache_url)
+        index = {
+            "vary": fields,
+            "variants": [{"id": legacy_id, "vary": identity}],
+        }
+        self._save_index(cache_url, index)
+        return index
+
+    def _prepare_variant_index(
+        self,
+        cache_url: str,
+        fields: tuple[str, ...],
+        request: PreparedRequest,
+    ) -> dict[str, Any]:
+        raw = self.cache.get(cache_url)
+        current_id = self._variant_id(fields, request.headers)
+
+        if raw is None:
+            return {"vary": fields, "variants": [], "current_id": current_id}
+
+        if self._is_index(raw):
+            index = self._loads_index(raw)
+            if index is None or tuple(index["vary"]) != fields:
+                self._invalidate_url(cache_url)
+                return {"vary": fields, "variants": [], "current_id": current_id}
+            index["current_id"] = current_id
+            return index
+
+        record = self._loads_record(raw)
+        if record is None:
+            self.cache.delete(cache_url)
+            return {"vary": fields, "variants": [], "current_id": current_id}
+
+        old_vary = record.get("vary", {})
+        old_response = record.get("response", {})
+        old_headers = (
+            old_response.get("headers", {})
+            if isinstance(old_response, Mapping)
+            else {}
+        )
+        old_response_headers = CaseInsensitiveDict(data=old_headers)
+        if (
+            not isinstance(old_response, Mapping)
+            or not isinstance(old_vary, Mapping)
+            or "*" in old_vary
+            or normalize_vary_fields(old_response_headers.get("vary")) == ("*",)
+        ):
+            self.cache.delete(cache_url)
+            return {"vary": fields, "variants": [], "current_id": current_id}
+
+        old_fields = tuple(sorted(str(field).lower() for field in old_vary))
+        if old_fields != fields:
+            self.cache.delete(cache_url)
+            return {"vary": fields, "variants": [], "current_id": current_id}
+
+        migrated = self._migrate_legacy_variant(cache_url, raw, record, fields)
+        if migrated is None:
+            self.cache.delete(cache_url)
+            return {"vary": fields, "variants": [], "current_id": current_id}
+
+        migrated["current_id"] = current_id
+        return migrated
+
+    def _store_response(
+        self,
+        cache_url: str,
+        request: PreparedRequest,
+        response: HTTPResponse,
+        body: bytes | None,
+        expires_time: int | None,
+        fields: tuple[str, ...],
+    ) -> None:
+        with self.variant_lock:
+            if not fields or not self._supports_variants():
+                raw = self.cache.get(cache_url)
+                if self._is_index(raw):
+                    self._invalidate_url(cache_url)
+                if expires_time is not None and expires_time <= 0:
+                    self.cache.delete(cache_url)
+                else:
+                    self._cache_set(
+                        cache_url, request, response, body, expires_time
+                    )
+                return
+
+            request_headers = (
+                CaseInsensitiveDict(data=request.headers)
+                if isinstance(request.headers, Mapping)
+                else request.headers
+            )
+            current_id = self._variant_id(fields, request_headers)
+            if expires_time is not None and expires_time <= 0:
+                raw = self.cache.get(cache_url)
+                index = self._loads_index(raw) if raw is not None else None
+                if index is not None and tuple(index["vary"]) == fields:
+                    self._remove_variant(cache_url, index, current_id)
+                return
+
+            index = self._prepare_variant_index(cache_url, fields, request)
+            variants = index["variants"]
+            existing = next(
+                (
+                    position
+                    for position, variant in enumerate(variants)
+                    if variant["id"] == current_id
+                ),
+                None,
+            )
+
+            if existing is None:
+                while len(variants) >= self.max_variants:
+                    evicted = variants.pop(0)
+                    self._delete_variant(cache_url, evicted["id"])
+                variants.append(
+                    {
+                        "id": current_id,
+                        "vary": {
+                            field: request_headers.get(field)
+                            for field in fields
+                        },
+                    }
+                )
+
+            self._save_index(cache_url, {"vary": fields, "variants": variants})
+            variant_key = self._variant_key(cache_url, current_id)
+            self._cache_set(variant_key, request, response, body, expires_time)
 
     def cache_response(
         self,
@@ -392,16 +728,18 @@ class CacheController:
             logger.debug('Request header has "no-store"')
         if no_store and self.cache.get(cache_url):
             logger.debug('Purging existing cache entry to honor "no-store"')
-            self.cache.delete(cache_url)
+            self._invalidate_url(cache_url)
         if no_store:
             return
+
+        vary_fields = normalize_vary_fields(response_headers.get("vary"))
 
         # https://tools.ietf.org/html/rfc7234#section-4.1:
         # A Vary header field-value of "*" always fails to match.
         # Storing such a response leads to a deserialization warning
         # during cache lookup and is not allowed to ever be served,
         # so storing it can be avoided.
-        if "*" in response_headers.get("vary", ""):
+        if vary_fields == ("*",):
             logger.debug('Response header has "Vary: *"')
             return
 
@@ -417,13 +755,15 @@ class CacheController:
 
             logger.debug(f"etag object cached for {expires_time} seconds")
             logger.debug("Caching due to etag")
-            self._cache_set(cache_url, request, response, body, expires_time)
+            self._store_response(
+                cache_url, request, response, body, expires_time, vary_fields
+            )
 
         # Add to the cache any permanent redirects. We do this before looking
         # that the Date headers.
         elif int(response.status) in PERMANENT_REDIRECT_STATUSES:
             logger.debug("Caching permanent redirect")
-            self._cache_set(cache_url, request, response, b"")
+            self._store_response(cache_url, request, response, b"", None, vary_fields)
 
         # Add to the cache if the response headers demand it. If there
         # is no date header then we can't do anything about expiring
@@ -438,12 +778,13 @@ class CacheController:
             if max_age is not None and max_age > 0:
                 logger.debug("Caching b/c date exists and max-age > 0")
                 expires_time = max_age
-                self._cache_set(
+                self._store_response(
                     cache_url,
                     request,
                     response,
                     body,
                     expires_time,
+                    vary_fields,
                 )
 
             # If the request can expire, it means we should cache it
@@ -465,12 +806,13 @@ class CacheController:
                             expires_time
                         )
                     )
-                    self._cache_set(
+                    self._store_response(
                         cache_url,
                         request,
                         response,
                         body,
                         expires_time,
+                        vary_fields,
                     )
 
     def update_cached_response(
@@ -484,11 +826,17 @@ class CacheController:
         """
         assert request.url is not None
         cache_url = self.cache_url(request.url)
-        cached_response = self._load_from_cache(request)
+        entry = self._load_cache_entry(request, cache_url)
 
-        if not cached_response:
+        if entry is None:
             # we didn't have a cached response
             return response
+        cached_response = entry["response"]
+        record = entry["record"]
+        if record is None:
+            return cached_response
+        old_vary = record.get("vary", {})
+        old_fields = tuple(sorted(str(field).lower() for field in old_vary))
 
         # Lets update our headers with the headers from the new request:
         # http://tools.ietf.org/html/draft-ietf-httpbis-p4-conditional-26#section-4.1
@@ -510,7 +858,38 @@ class CacheController:
         # we want a 200 b/c we have content via the cache
         cached_response.status = 200
 
-        # update our cache
-        self._cache_set(cache_url, request, cached_response)
+        if "vary" in response.headers:
+            vary_fields = normalize_vary_fields(response.headers["vary"])
+        else:
+            vary_fields = old_fields
+
+        if vary_fields == ("*",):
+            logger.debug('Response header has "Vary: *"')
+            return cached_response
+
+        if "no-store" in self.parse_cache_control(response.headers):
+            logger.debug('Purging validated response to honor "no-store"')
+            if entry["legacy"]:
+                self.cache.delete(cache_url)
+            else:
+                self._remove_variant(cache_url, entry["index"], entry["id"])
+            return cached_response
+
+        body_for_update = None
+        if self._supports_variants() and (
+            entry["legacy"] or old_fields != vary_fields
+        ):
+            body_for_update = cached_response.read(decode_content=False)
+            cached_response._fp = io.BytesIO(body_for_update)
+            cached_response.length_remaining = len(body_for_update)
+
+        self._store_response(
+            cache_url,
+            request,
+            cached_response,
+            body_for_update,
+            None,
+            vary_fields,
+        )
 
         return cached_response

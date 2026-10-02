@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import hashlib
 import io
+from copy import deepcopy
 from typing import IO, TYPE_CHECKING, Any, Mapping, cast
 
 import msgpack
@@ -16,6 +18,8 @@ if TYPE_CHECKING:
 
 class Serializer:
     serde_version = "4"
+    index_version = "1"
+    index_prefix = f"cc=variants={index_version},".encode()
 
     def dumps(
         self,
@@ -46,21 +50,101 @@ class Serializer:
             }
         }
 
+        field_names = normalize_vary_fields(response_headers.get("vary"))
+
         # Construct our vary headers
         data["vary"] = {}
-        if "vary" in response_headers:
-            varied_headers = response_headers["vary"].split(",")
-            for header in varied_headers:
-                header = str(header).strip()
-                header_value = request.headers.get(header, None)
+        request_headers = (
+            CaseInsensitiveDict(data=request.headers)
+            if isinstance(request.headers, Mapping)
+            else request.headers
+        )
+        if field_names != ("*",):
+            for header in field_names:
+                header_value = request_headers.get(header, None)
                 if header_value is not None:
                     header_value = str(header_value)
                 data["vary"][header] = header_value
 
         return b",".join([f"cc={self.serde_version}".encode(), self.serialize(data)])
 
+    def dumps_index(
+        self,
+        vary_fields: tuple[str, ...],
+        variants: list[dict[str, Any]],
+    ) -> bytes:
+        data = {
+            "version": int(self.index_version),
+            "vary": list(vary_fields),
+            "variants": variants,
+        }
+        return self.index_prefix + self.serialize(data)
+
+    def variant_id(
+        self,
+        vary_fields: tuple[str, ...],
+        headers: Mapping[str, Any],
+    ) -> str:
+        normalized_headers = CaseInsensitiveDict(data=dict(headers))
+        values = [
+            (field, normalize_header_value(normalized_headers.get(field, None)))
+            for field in vary_fields
+        ]
+        serialized = msgpack.packb(values, use_bin_type=True)
+        return hashlib.sha256(serialized).hexdigest()
+
     def serialize(self, data: dict[str, Any]) -> bytes:
         return cast(bytes, msgpack.dumps(data, use_bin_type=True))
+
+    def loads_index(self, data: bytes) -> dict[str, Any] | None:
+        if not data.startswith(self.index_prefix):
+            return None
+
+        try:
+            cached = msgpack.loads(data[len(self.index_prefix) :], raw=False)
+            fields = cached["vary"]
+            variants = cached["variants"]
+            if not isinstance(fields, list) or not isinstance(variants, list):
+                return None
+
+            normalized_fields = normalize_vary_fields(",".join(fields))
+            if normalized_fields == ("*",):
+                return None
+            normalized_variants = []
+            for variant in variants:
+                variant_id = variant["id"]
+                vary = variant["vary"]
+                if not isinstance(variant_id, str) or not isinstance(vary, dict):
+                    return None
+                normalized_vary = {
+                    str(field).lower(): normalize_header_value(value)
+                    for field, value in vary.items()
+                }
+                if tuple(normalized_vary) != normalized_fields:
+                    return None
+                expected_id = self.variant_id(normalized_fields, normalized_vary)
+                if variant_id != expected_id:
+                    return None
+                ordered_vary = {
+                    field: normalized_vary[field] for field in normalized_fields
+                }
+                normalized_variants.append(
+                    {"id": variant_id, "vary": ordered_vary}
+                )
+
+            return {"vary": normalized_fields, "variants": normalized_variants}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def loads_record(self, data: bytes) -> Mapping[str, Any] | None:
+        prefix = f"cc={self.serde_version},".encode()
+        if not data.startswith(prefix):
+            return None
+
+        try:
+            return msgpack.loads(data[len(prefix) :], raw=False)
+        except ValueError:
+            return None
 
     def loads(
         self,
@@ -80,6 +164,9 @@ class Serializer:
         data = data[5:]
         return self._loads_v4(request, data, body_file)
 
+    def is_index(self, data: bytes | None) -> bool:
+        return isinstance(data, bytes) and data.startswith(self.index_prefix)
+
     def prepare_response(
         self,
         request: PreparedRequest,
@@ -93,13 +180,23 @@ class Serializer:
         # determine if the cached response is suitable for this request.
         # This case is also handled in the controller code when creating
         # a cache entry, but is left here for backwards compatibility.
-        if "*" in cached.get("vary", {}):
+        response_headers = CaseInsensitiveDict(
+            data=cached.get("response", {}).get("headers", {})
+        )
+        if "*" in cached.get("vary", {}) or normalize_vary_fields(
+            response_headers.get("vary")
+        ) == ("*",):
             return None
 
         # Ensure that the Vary headers for the cached response match our
         # request
+        request_headers = (
+            CaseInsensitiveDict(data=request.headers)
+            if isinstance(request.headers, Mapping)
+            else request.headers
+        )
         for header, value in cached.get("vary", {}).items():
-            if request.headers.get(header, None) != value:
+            if request_headers.get(header, None) != value:
                 return None
 
         body_raw = cached["response"].pop("body")
@@ -143,4 +240,24 @@ class Serializer:
         except ValueError:
             return None
 
-        return self.prepare_response(request, cached, body_file)
+        return self.prepare_response(request, deepcopy(cached), body_file)
+
+
+def normalize_header_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def normalize_vary_fields(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    fields = {
+        field.strip().lower()
+        for field in str(value).split(",")
+        if field.strip()
+    }
+    if "*" in fields:
+        return ("*",)
+    return tuple(sorted(fields))

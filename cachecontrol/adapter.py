@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import weakref
 import zlib
 from typing import TYPE_CHECKING, Any, Collection, Mapping
@@ -11,7 +12,11 @@ from typing import TYPE_CHECKING, Any, Collection, Mapping
 from requests.adapters import HTTPAdapter
 
 from cachecontrol.cache import DictCache
-from cachecontrol.controller import PERMANENT_REDIRECT_STATUSES, CacheController
+from cachecontrol.controller import (
+    DEFAULT_MAX_VARIANTS,
+    PERMANENT_REDIRECT_STATUSES,
+    CacheController,
+)
 from cachecontrol.filewrapper import CallbackFileWrapper
 
 if TYPE_CHECKING:
@@ -34,6 +39,7 @@ class CacheControlAdapter(HTTPAdapter):
         serializer: Serializer | None = None,
         heuristic: BaseHeuristic | None = None,
         cacheable_methods: Collection[str] | None = None,
+        max_variants: int = DEFAULT_MAX_VARIANTS,
         *args: Any,
         **kw: Any,
     ) -> None:
@@ -43,8 +49,22 @@ class CacheControlAdapter(HTTPAdapter):
         self.cacheable_methods = cacheable_methods or ("GET",)
 
         controller_factory = controller_class or CacheController
+        controller_kwargs = {
+            "cache_etags": cache_etags,
+            "serializer": serializer,
+        }
+        controller_signature = inspect.signature(controller_factory)
+        if (
+            "max_variants" in controller_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in controller_signature.parameters.values()
+            )
+        ):
+            controller_kwargs["max_variants"] = max_variants
         self.controller = controller_factory(
-            self.cache, cache_etags=cache_etags, serializer=serializer
+            self.cache,
+            **controller_kwargs,
         )
 
     def send(
@@ -159,7 +179,7 @@ class CacheControlAdapter(HTTPAdapter):
         if request.method in self.invalidating_methods and resp.ok:
             assert request.url is not None
             cache_url = self.controller.cache_url(request.url)
-            self.cache.delete(cache_url)
+            self.controller._invalidate_url(cache_url)
 
         # Give the request a from_cache attr to let people use it
         resp.from_cache = from_cache  # type: ignore[attr-defined]
