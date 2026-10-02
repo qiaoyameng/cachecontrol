@@ -6,9 +6,7 @@ import os
 import socket
 from pprint import pformat
 
-import cherrypy
 import pytest
-from cheroot.server import HTTPRequest
 
 
 class SimpleApp:
@@ -133,6 +131,8 @@ class SimpleApp:
 
 @pytest.fixture(scope="session")
 def server():
+    import cherrypy
+
     cherrypy.tree.graft(SimpleApp(), "/")
 
     ip, port = get_free_port()
@@ -159,6 +159,8 @@ def url(server):
 @pytest.fixture()
 def malformed_chunk_delimiters(monkeypatch):
     """Make the test server send XX instead of each chunk's trailing CRLF."""
+    from cheroot.server import HTTPRequest
+
     write = HTTPRequest.write
 
     def write_malformed_chunk(request, chunk):

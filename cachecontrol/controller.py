@@ -9,6 +9,7 @@ The httplib2 algorithms ported for use with requests.
 from __future__ import annotations
 
 import calendar
+import io
 import logging
 import re
 import time
@@ -17,6 +18,7 @@ from email.utils import parsedate_tz
 from typing import TYPE_CHECKING, Collection, Mapping
 
 from requests.structures import CaseInsensitiveDict
+from urllib3 import HTTPResponse
 
 from cachecontrol.cache import DictCache, SeparateBodyBaseCache
 from cachecontrol.serialize import Serializer
@@ -25,7 +27,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from requests import PreparedRequest
-    from urllib3 import HTTPResponse
 
     from cachecontrol.cache import BaseCache
 
@@ -175,19 +176,30 @@ class CacheController:
         cache_url = self.cache_url(request.url)
         logger.debug('Looking up "%s" in the cache', cache_url)
         cc = self.parse_cache_control(request.headers)
+        only_if_cached = "only-if-cached" in cc
 
         # Bail out if the request insists on fresh data
         if "no-cache" in cc:
             logger.debug('Request header has "no-cache", cache bypassed')
+            if only_if_cached:
+                return self._only_if_cached_failure(
+                    request, "request requires revalidation (no-cache)"
+                )
             return False
 
         if "max-age" in cc and cc["max-age"] == 0:
             logger.debug('Request header has "max_age" as 0, cache bypassed')
+            if only_if_cached:
+                return self._only_if_cached_failure(
+                    request, "request requires revalidation (max-age=0)"
+                )
             return False
 
         # Check whether we can load the response from the cache:
         resp = self._load_from_cache(request)
         if not resp:
+            if only_if_cached:
+                return self._only_if_cached_failure(request, "no cache entry")
             return False
 
         # Apply normal freshness checks to every cached response. In the case
@@ -203,12 +215,20 @@ class CacheController:
                 logger.debug("Purging cached response: no date or etag")
                 self.cache.delete(cache_url)
             logger.debug("Ignoring cached response: no date")
+            if only_if_cached:
+                return self._only_if_cached_failure(
+                    request, "cache entry has no usable date or etag"
+                )
             return False
 
         now = time.time()
         time_tuple = parsedate_tz(headers["date"])
         if time_tuple is None:
             logger.debug("Ignoring cached response: invalid date")
+            if only_if_cached:
+                return self._only_if_cached_failure(
+                    request, "cache entry has an invalid date"
+                )
             return False
         date = calendar.timegm(time_tuple[:6])
         current_age = max(0, now - date)
@@ -264,6 +284,24 @@ class CacheController:
             logger.debug("%i > %i", freshness_lifetime, current_age)
             return resp
 
+        # The cached response is stale. A stale entry may still be served
+        # when the request explicitly allows it via max-stale, unless the
+        # response forbids stale reuse with must-revalidate.
+        staleness = current_age - freshness_lifetime
+        if "must-revalidate" in resp_cc:
+            logger.debug('Cached response has "must-revalidate", stale use denied')
+        elif "max-stale" in cc:
+            max_stale = cc["max-stale"]
+            if max_stale is None or staleness <= max_stale:
+                logger.debug('Serving stale response allowed by "max-stale"')
+                return resp
+            logger.debug("Staleness %i exceeds max-stale %i", staleness, max_stale)
+
+        if only_if_cached:
+            return self._only_if_cached_failure(
+                request, "cache entry is stale and cannot be served"
+            )
+
         # we're not fresh. If we don't have an Etag, clear it out
         if "etag" not in headers:
             logger.debug('The cached response is "stale" with no etag, purging')
@@ -271,6 +309,31 @@ class CacheController:
 
         # return the original handler
         return False
+
+    def _only_if_cached_failure(
+        self, request: PreparedRequest, reason: str
+    ) -> HTTPResponse:
+        """Build a 504 Gateway Timeout for an unsatisfiable only-if-cached
+        request.
+
+        The reason is logged for diagnostics: it distinguishes a missing
+        cache entry from an entry that exists but is not usable, and is
+        computed from state already in hand, so diagnosing never triggers
+        another read of a cached response stream.
+        """
+        logger.debug(
+            'only-if-cached request for "%s" cannot be satisfied: %s; '
+            "returning 504 Gateway Timeout",
+            request.url,
+            reason,
+        )
+        return HTTPResponse(
+            body=io.BytesIO(b""),
+            status=504,
+            reason="Gateway Timeout",
+            headers={"Content-Length": "0"},
+            preload_content=False,
+        )
 
     def conditional_headers(self, request: PreparedRequest) -> dict[str, str]:
         resp = self._load_from_cache(request)

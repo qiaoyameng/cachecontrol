@@ -77,5 +77,35 @@ The `FileCache` will create a directory called `.webcache` and store a
 file for each cached request.
 
 
+Only-If-Cached
+==============
+
+Sending a request with the ``Cache-Control: only-if-cached`` header
+tells CacheControl to answer from the cache alone and never touch the
+network. This is useful for offline operation: ::
+
+  resp = sess.get('http://example.com',
+                  headers={'Cache-Control': 'only-if-cached'})
+
+The cached entry is judged together with the other cache directives:
+
+* ``max-age`` and ``min-fresh`` constrain how fresh the entry must be.
+* ``max-stale`` (optionally with a value) allows serving a stale entry,
+  unless the cached response carries ``must-revalidate``.
+* ``no-cache`` (or ``max-age=0``) on the request demands revalidation,
+  which a cache-only lookup cannot perform.
+
+When no usable representation is available, CacheControl returns a
+synthetic ``504 Gateway Timeout`` response with ``from_cache`` set to
+``True`` (no network request was made). The diagnostics logged by the
+``cachecontrol.controller`` logger distinguish a missing cache entry
+("no cache entry") from an entry that exists but is not usable (for
+example "cache entry is stale and cannot be served"), and are computed
+without re-reading the cached response stream.
+
+Redirect chains are subject to the same restriction: every hop of a
+redirect is resolved from the cache, and any hop that cannot be
+satisfied from the cache results in the same ``504`` response.
+
 
 .. _Transport Adapter: http://docs.python-requests.org/en/latest/user/advanced/#transport-adapters
